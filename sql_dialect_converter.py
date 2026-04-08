@@ -985,6 +985,7 @@ class FileConverter:
         # Convert only the unprotected (SQL) segments
         result_parts = []
         sql_segment_count = 0
+        segments_changed = 0
         for text, protected in segments:
             if protected:
                 result_parts.append(text)
@@ -992,11 +993,12 @@ class FileConverter:
                 sql_segment_count += 1
                 converted, rules = converter.convert(text)
                 if rules:
+                    segments_changed += 1
                     report.rules_applied.extend(rules)
                 result_parts.append(converted)
 
         report.strings_found = sql_segment_count
-        report.strings_changed = 1 if report.rules_applied else 0
+        report.strings_changed = segments_changed
 
         return ''.join(result_parts)
 
@@ -1048,8 +1050,10 @@ def process_file(input_path: str, output_path: Optional[str],
             with open(output_path, 'w', encoding='utf-8') as f:
                 f.write(result)
     elif dry_run:
+        rules_count = len(set(report.rules_applied))
         log.info(f"[DRY RUN] {report.file}: --!{report.dialect} → --!{report.target}  "
-                 f"{report.strings_found} SQL strings, {report.strings_changed} changed")
+                 f"{rules_count} rules applied across "
+                 f"{report.strings_changed}/{report.strings_found} SQL regions")
         for rule in sorted(set(report.rules_applied)):
             log.info(f"  → {rule}")
     else:
@@ -1057,9 +1061,11 @@ def process_file(input_path: str, output_path: Optional[str],
         os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
         with open(out, 'w', encoding='utf-8') as f:
             f.write(result)
+        rules_count = len(set(report.rules_applied))
         log.info(f"Converted {report.file} → {out}  "
                  f"[--!{report.dialect} → --!{report.target}]  "
-                 f"({report.strings_changed}/{report.strings_found} strings changed)")
+                 f"({rules_count} rules applied, "
+                 f"{report.strings_changed}/{report.strings_found} SQL regions changed)")
 
     return report
 
