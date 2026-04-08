@@ -132,9 +132,20 @@ class SQLConverter:
     def _build_rules(self):
         raise NotImplementedError
 
+    def _pre_passes(self, sql: str) -> tuple[str, list[str]]:
+        """Override in subclasses for complex rewrites that can't be done
+        with simple regex sub (e.g. DECODE with variable args)."""
+        return sql, []
+
     def convert(self, sql: str) -> tuple[str, list[str]]:
         applied = []
         result = sql
+
+        # Run complex pre-passes first
+        result, pre_applied = self._pre_passes(result)
+        applied.extend(pre_applied)
+
+        # Then run regex rules
         for desc, pattern, repl in self.rules:
             new = pattern.sub(repl, result) if not callable(repl) \
                   else pattern.sub(repl, result)
@@ -149,11 +160,194 @@ def _add(rules, desc, pattern, repl, flags=re.IGNORECASE):
     rules.append((desc, re.compile(pattern, flags), repl))
 
 
+# ---------------------------------------------------------------------------
+#  Complex rewrite helpers (used as callables inside rules)
+# ---------------------------------------------------------------------------
+
+def _extract_balanced_args(s: str) -> list[str]:
+    """
+    Split a string by top-level commas, respecting nested parens and quotes.
+    e.g. "a, FUNC(b, c), 'x,y'" → ["a", "FUNC(b, c)", "'x,y'"]
+    """
+    args = []
+    depth = 0
+    current = []
+    in_quote = False
+
+    for ch in s:
+        if ch == "'" and not in_quote:
+            in_quote = True
+            current.append(ch)
+        elif ch == "'" and in_quote:
+            in_quote = False
+            current.append(ch)
+        elif in_quote:
+            current.append(ch)
+        elif ch == '(':
+            depth += 1
+            current.append(ch)
+        elif ch == ')':
+            depth -= 1
+            current.append(ch)
+        elif ch == ',' and depth == 0:
+            args.append(''.join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+
+    if current:
+        args.append(''.join(current).strip())
+
+    return args
+
+
+def _find_balanced_parens(s: str, start: int) -> int:
+    """
+    Given s and the index of an opening '(', return the index of the
+    matching closing ')'.  Returns -1 if unbalanced.
+    """
+    depth = 0
+    in_quote = False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if ch == "'" and not in_quote:
+            in_quote = True
+        elif ch == "'" and in_quote:
+            in_quote = False
+        elif not in_quote:
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+                if depth == 0:
+                    return i
+    return -1
+
+
+def _decode_to_case(m: re.Match) -> str:
+    """
+    Convert DECODE(expr, search1, result1 [, search2, result2 ...] [, default])
+    to CASE WHEN expr = search1 THEN result1 ... ELSE default END.
+    """
+    # m matched \bDECODE\s*\(  — we need to find the full arg list
+    # Since regex can't handle variable args, we find the closing paren
+    # from the original match, then parse the args.
+    full = m.string
+    open_idx = m.end() - 1  # index of the '('
+    close_idx = _find_balanced_parens(full, open_idx)
+    if close_idx == -1:
+        return m.group(0)  # can't parse, leave as-is
+
+    inner = full[open_idx + 1:close_idx]
+    args = _extract_balanced_args(inner)
+
+    if len(args) < 3:
+        return m.group(0)  # not enough args, leave as-is
+
+    expr = args[0]
+    parts = ["CASE"]
+
+    # Pairs of (search, result)
+    i = 1
+    while i + 1 < len(args):
+        parts.append(f"WHEN {expr} = {args[i]} THEN {args[i+1]}")
+        i += 2
+
+    # If there's an odd remaining arg, it's the default
+    if i < len(args):
+        parts.append(f"ELSE {args[i]}")
+
+    parts.append("END")
+
+    # We need to return the replacement for the entire DECODE(...) region.
+    # But the regex only matched up to the '(' — the rest of the match
+    # extends beyond what the regex captured.  We use a trick: return
+    # the CASE expression plus a marker to tell the caller how much
+    # of the original string was consumed.  Since regex sub can't do this,
+    # we'll handle DECODE as a special pre-pass instead.
+    return ' '.join(parts)
+
+
+def _decode_prepass(sql: str) -> tuple[str, bool]:
+    """
+    Pre-processing pass: find all DECODE(...) calls and convert to CASE.
+    Returns (converted_sql, changed).
+    """
+    pattern = re.compile(r'\bDECODE\s*\(', re.IGNORECASE)
+    result = sql
+    changed = False
+
+    # Process from right to left so offsets stay valid
+    matches = list(pattern.finditer(result))
+    for m in reversed(matches):
+        open_idx = m.end() - 1
+        close_idx = _find_balanced_parens(result, open_idx)
+        if close_idx == -1:
+            continue
+
+        inner = result[open_idx + 1:close_idx]
+        args = _extract_balanced_args(inner)
+
+        if len(args) < 3:
+            continue
+
+        expr = args[0]
+        parts = ["CASE"]
+        i = 1
+        while i + 1 < len(args):
+            parts.append(f"WHEN {expr} = {args[i]} THEN {args[i+1]}")
+            i += 2
+        if i < len(args):
+            parts.append(f"ELSE {args[i]}")
+        parts.append("END")
+
+        case_expr = ' '.join(parts)
+        result = result[:m.start()] + case_expr + result[close_idx + 1:]
+        changed = True
+
+    return result, changed
+
+
+# Java-style → MySQL-style date format specifier mapping
+_JAVA_TO_MYSQL_FMT = {
+    'yyyy': '%Y', 'yy': '%y',
+    'MM': '%m', 'M': '%c',
+    'dd': '%d', 'd': '%e',
+    'HH': '%H', 'hh': '%h', 'H': '%k', 'h': '%l',
+    'mm': '%i',
+    'ss': '%s', 'S': '%f',
+    'a': '%p',      # AM/PM
+    'EEE': '%a',    # abbreviated day name
+    'EEEE': '%W',   # full day name
+    'MMM': '%b',    # abbreviated month name
+    'MMMM': '%M',   # full month name
+}
+
+# Build a regex that matches the longest specifiers first
+_JAVA_FMT_RE = re.compile(
+    '|'.join(re.escape(k) for k in
+             sorted(_JAVA_TO_MYSQL_FMT.keys(), key=len, reverse=True))
+)
+
+
+def _convert_java_to_mysql_format(fmt_str: str) -> str:
+    """Convert a Java-style date format string to MySQL/Trino style."""
+    return _JAVA_FMT_RE.sub(lambda m: _JAVA_TO_MYSQL_FMT[m.group(0)], fmt_str)
+
+
 # ===========================================================================
 #  IMPALA → TRINO  RULES
 # ===========================================================================
 
 class ImpalaToTrinoConverter(SQLConverter):
+
+    def _pre_passes(self, sql):
+        """Handle DECODE→CASE which requires balanced-paren parsing."""
+        applied = []
+        result, changed = _decode_prepass(sql)
+        if changed:
+            applied.append("DECODE(...) → CASE WHEN ... END")
+        return result, applied
 
     def _build_rules(self):
         r = []
@@ -269,6 +463,65 @@ class ImpalaToTrinoConverter(SQLConverter):
              lambda m: f"(({m.group(1).strip()} % {m.group(2).strip()}) "
                         f"+ {m.group(2).strip()}) % {m.group(2).strip()}")
 
+        # Window functions / analytics
+        _add(r, "NDV(col) → APPROX_DISTINCT(col)",
+             r"\bNDV\s*\(", "APPROX_DISTINCT(")
+        _add(r, "APPX_MEDIAN(col) → APPROX_PERCENTILE(col, 0.5)",
+             r"\bAPPX_MEDIAN\s*\(\s*(" + _BODY + r")\s*\)",
+             lambda m: f"APPROX_PERCENTILE({m.group(1).strip()}, 0.5)")
+        _add(r, "ANALYTIC: FIRST_VALUE IGNORE NULLS → FIRST_VALUE ... IGNORE NULLS (same syntax)",
+             r"placeholder_fv_xyzzy", "")  # same in Trino, doc-only
+        _add(r, "GROUP_CONCAT in window → ARRAY_JOIN(ARRAY_AGG(...) OVER ...)",
+             r"placeholder_gc_window_xyzzy", "")  # handled by GROUP_CONCAT rule above
+
+        # ── REGEXP operator ────────────────────────────────────────────
+        _add(r, "col REGEXP 'pat' → REGEXP_LIKE(col, 'pat')",
+             r"\b(\S+)\s+REGEXP\s+'([^']+)'",
+             lambda m: f"REGEXP_LIKE({m.group(1).strip()}, '{m.group(2)}')")
+
+        # ── Null-handling functions ────────────────────────────────────
+        _add(r, "NULLIFZERO(x) → NULLIF(x, 0)",
+             r"\bNULLIFZERO\s*\(\s*(" + _BODY + r")\s*\)",
+             lambda m: f"NULLIF({m.group(1).strip()}, 0)")
+        _add(r, "ZEROIFNULL(x) → COALESCE(x, 0)",
+             r"\bZEROIFNULL\s*\(\s*(" + _BODY + r")\s*\)",
+             lambda m: f"COALESCE({m.group(1).strip()}, 0)")
+        _add(r, "ISNULL(x) → (x IS NULL)  [predicate form]",
+             r"\bISNULL\s*\(\s*(" + _BODY + r")\s*\)",
+             lambda m: f"({m.group(1).strip()} IS NULL)")
+
+        # ── Timezone functions ─────────────────────────────────────────
+        _add(r, "from_utc_timestamp(ts, tz) → AT TIME ZONE",
+             r"\bFROM_UTC_TIMESTAMP\s*\(\s*(" + _ARG + r")\s*,\s*(" + _ARG + r")\s*\)",
+             lambda m: f"CAST({m.group(1).strip()} AS TIMESTAMP) AT TIME ZONE {m.group(2).strip()}")
+        _add(r, "to_utc_timestamp(ts, tz) → AT TIME ZONE 'UTC'",
+             r"\bTO_UTC_TIMESTAMP\s*\(\s*(" + _ARG + r")\s*,\s*(" + _ARG + r")\s*\)",
+             lambda m: f"CAST({m.group(1).strip()} AT TIME ZONE {m.group(2).strip()} AS TIMESTAMP) AT TIME ZONE 'UTC'")
+
+        # ── Semi/Anti joins (rewrite to EXISTS/NOT EXISTS) ─────────────
+        # These can't be auto-converted perfectly for all cases, but the
+        # common pattern  SELECT ... FROM t1 LEFT SEMI JOIN t2 ON cond
+        # can be flagged clearly.
+        _add(r, "LEFT SEMI JOIN → flag for EXISTS rewrite",
+             r"\bLEFT\s+SEMI\s+JOIN\b",
+             "/* TODO: Rewrite LEFT SEMI JOIN to WHERE EXISTS (...) */ JOIN")
+        _add(r, "RIGHT SEMI JOIN → flag for EXISTS rewrite",
+             r"\bRIGHT\s+SEMI\s+JOIN\b",
+             "/* TODO: Rewrite RIGHT SEMI JOIN to WHERE EXISTS (...) */ JOIN")
+        _add(r, "LEFT ANTI JOIN → flag for NOT EXISTS rewrite",
+             r"\bLEFT\s+ANTI\s+JOIN\b",
+             "/* TODO: Rewrite LEFT ANTI JOIN to WHERE NOT EXISTS (...) or LEFT JOIN ... WHERE key IS NULL */ LEFT JOIN")
+        _add(r, "RIGHT ANTI JOIN → flag for NOT EXISTS rewrite",
+             r"\bRIGHT\s+ANTI\s+JOIN\b",
+             "/* TODO: Rewrite RIGHT ANTI JOIN to WHERE NOT EXISTS (...) */ RIGHT JOIN")
+
+        # ── Date format specifier conversion (Java→MySQL style) ───────
+        # Targets format strings inside date_format() and date_parse()
+        _add(r, "date_format/date_parse format: Java→MySQL specifiers",
+             r"\b(DATE_FORMAT|DATE_PARSE)\s*\(\s*(" + _ARG + r")\s*,\s*'([^']+)'\s*\)",
+             lambda m: (f"{m.group(1)}({m.group(2).strip()}, "
+                        f"'{_convert_java_to_mysql_format(m.group(3))}')"))
+
         # Identifiers / hints / misc
         _add(r, "Backtick identifiers → double-quotes",
              r"`([^`]+)`", r'"\1"')
@@ -287,6 +540,14 @@ class ImpalaToTrinoConverter(SQLConverter):
 # ===========================================================================
 
 class HiveToPrestoConverter(SQLConverter):
+
+    def _pre_passes(self, sql):
+        """Handle DECODE→CASE which requires balanced-paren parsing."""
+        applied = []
+        result, changed = _decode_prepass(sql)
+        if changed:
+            applied.append("DECODE(...) → CASE WHEN ... END")
+        return result, applied
 
     def _build_rules(self):
         r = []
@@ -426,6 +687,28 @@ class HiveToPrestoConverter(SQLConverter):
              r"\bLATERAL\s+VIEW\s+POSEXPLODE\s*\(\s*(" + _BODY + r")\s*\)\s+(\w+)\s+AS\s+(\w+)\s*,\s*(\w+)",
              lambda m: f"CROSS JOIN UNNEST({m.group(1).strip()}) WITH ORDINALITY "
                         f"AS {m.group(2).strip()}({m.group(4).strip()}, {m.group(3).strip()})")
+
+        # ── Timezone functions ─────────────────────────────────────────
+        _add(r, "from_utc_timestamp(ts, tz) → AT TIME ZONE",
+             r"\bFROM_UTC_TIMESTAMP\s*\(\s*(" + _ARG + r")\s*,\s*(" + _ARG + r")\s*\)",
+             lambda m: f"CAST({m.group(1).strip()} AS TIMESTAMP) AT TIME ZONE {m.group(2).strip()}")
+        _add(r, "to_utc_timestamp(ts, tz) → AT TIME ZONE 'UTC'",
+             r"\bTO_UTC_TIMESTAMP\s*\(\s*(" + _ARG + r")\s*,\s*(" + _ARG + r")\s*\)",
+             lambda m: f"CAST({m.group(1).strip()} AT TIME ZONE {m.group(2).strip()} AS TIMESTAMP) AT TIME ZONE 'UTC'")
+
+        # ── Semi/Anti joins ────────────────────────────────────────────
+        _add(r, "LEFT SEMI JOIN → flag for EXISTS rewrite",
+             r"\bLEFT\s+SEMI\s+JOIN\b",
+             "/* TODO: Rewrite LEFT SEMI JOIN to WHERE EXISTS (...) */ JOIN")
+        _add(r, "LEFT ANTI JOIN → flag for NOT EXISTS rewrite",
+             r"\bLEFT\s+ANTI\s+JOIN\b",
+             "/* TODO: Rewrite LEFT ANTI JOIN to WHERE NOT EXISTS (...) or LEFT JOIN ... WHERE key IS NULL */ LEFT JOIN")
+
+        # ── Date format specifier conversion (Java→MySQL style) ───────
+        _add(r, "date_format/date_parse format: Java→MySQL specifiers",
+             r"\b(DATE_FORMAT|DATE_PARSE)\s*\(\s*(" + _ARG + r")\s*,\s*'([^']+)'\s*\)",
+             lambda m: (f"{m.group(1)}({m.group(2).strip()}, "
+                        f"'{_convert_java_to_mysql_format(m.group(3))}')"))
 
         # Identifiers / misc
         _add(r, "Backtick identifiers → double-quotes",
@@ -619,17 +902,103 @@ class FileConverter:
     def _convert_raw_sql(source: str, converter: SQLConverter,
                          report: ConversionReport) -> str:
         """
-        For .sql / .hql / .ddl files: apply conversion rules directly
-        to the entire file content (the SQL is raw text, not inside
-        JS string literals).
+        For .sql / .hql / .ddl files: apply conversion rules to the SQL
+        portions of the file while protecting scripting constructs:
+
+          - --!javascript ... --!endjavascript  blocks (entire block)
+          - --!eval  lines (JavaScript expressions)
+          - --!if / --!else / --!endif           directives
+          - --!forquery / --!do / --!done        directives
+          - Any other --! directive lines
         """
-        report.strings_found = 1   # treat whole file as one SQL block
-        converted, rules = converter.convert(source)
-        if rules:
-            report.strings_changed = 1
-            report.rules_applied.extend(rules)
-            return converted
-        return source
+        # Split file into PROTECTED (scripting) and CONVERTIBLE (SQL) segments.
+        # A segment is a tuple (text, protected:bool).
+        segments: list[tuple[str, bool]] = []
+        pos = 0
+        in_js_block = False
+        js_block_start = -1
+
+        lines = source.split('\n')
+        line_starts = []
+        offset = 0
+        for line in lines:
+            line_starts.append(offset)
+            offset += len(line) + 1  # +1 for the newline
+
+        i = 0
+        # Track the start of the current SQL region
+        sql_region_start = 0
+
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip().lower()
+
+            if not in_js_block and stripped.startswith('--!javascript'):
+                # Flush any SQL before this block
+                if line_starts[i] > sql_region_start:
+                    segments.append((source[sql_region_start:line_starts[i]], False))
+                # Enter JS block – find matching --!endjavascript
+                js_start = line_starts[i]
+                j = i + 1
+                while j < len(lines):
+                    if lines[j].strip().lower().startswith('--!endjavascript'):
+                        break
+                    j += 1
+                # Include the --!endjavascript line
+                js_end = line_starts[j] + len(lines[j]) + 1 if j < len(lines) else len(source)
+                segments.append((source[js_start:js_end], True))
+                sql_region_start = js_end
+                i = j + 1
+                continue
+
+            elif stripped.startswith('--!eval'):
+                # Protect the entire --!eval line
+                if line_starts[i] > sql_region_start:
+                    segments.append((source[sql_region_start:line_starts[i]], False))
+                line_end = line_starts[i] + len(line) + 1
+                segments.append((source[line_starts[i]:line_end], True))
+                sql_region_start = line_end
+                i += 1
+                continue
+
+            elif stripped.startswith('--!') and not stripped.startswith('--!impala') \
+                    and not stripped.startswith('--!hive') \
+                    and not stripped.startswith('--!null') \
+                    and not stripped.startswith('--!trino') \
+                    and not stripped.startswith('--!presto'):
+                # Protect other directive lines (--!if, --!else, --!endif,
+                # --!forquery, --!do, --!done, --!macro, etc.)
+                if line_starts[i] > sql_region_start:
+                    segments.append((source[sql_region_start:line_starts[i]], False))
+                line_end = line_starts[i] + len(line) + 1
+                segments.append((source[line_starts[i]:line_end], True))
+                sql_region_start = line_end
+                i += 1
+                continue
+
+            i += 1
+
+        # Flush remaining SQL
+        if sql_region_start < len(source):
+            segments.append((source[sql_region_start:], False))
+
+        # Convert only the unprotected (SQL) segments
+        result_parts = []
+        sql_segment_count = 0
+        for text, protected in segments:
+            if protected:
+                result_parts.append(text)
+            else:
+                sql_segment_count += 1
+                converted, rules = converter.convert(text)
+                if rules:
+                    report.rules_applied.extend(rules)
+                result_parts.append(converted)
+
+        report.strings_found = sql_segment_count
+        report.strings_changed = 1 if report.rules_applied else 0
+
+        return ''.join(result_parts)
 
     @staticmethod
     def _convert_embedded_sql(source: str, converter: SQLConverter,
@@ -890,9 +1259,15 @@ SELECT id,
        TO_DATE(created_ts),
        TO_DATE(TRUNC(mn.admissiondate, 'MM')),
        GROUP_CONCAT(`status`),
-       DATEDIFF(NOW(), TRUNC(ts, 'DD'))
+       DATEDIFF(NOW(), TRUNC(ts, 'DD')),
+       DECODE(status, 1, 'active', 2, 'inactive', 'unknown'),
+       NULLIFZERO(balance),
+       ZEROIFNULL(quantity),
+       FROM_UTC_TIMESTAMP(event_ts, 'America/New_York')
 FROM db.source
-WHERE DATEDIFF(NOW(), created_ts) <= 30;
+LEFT SEMI JOIN db.lookup ON db.source.key = db.lookup.key
+WHERE DATEDIFF(NOW(), created_ts) <= 30
+  AND name REGEXP '^[A-Z].*';
 
 COMPUTE STATS db.target;
 """
@@ -905,8 +1280,11 @@ SELECT
     COLLECT_LIST(payload),
     SIZE(tags),
     UNIX_TIMESTAMP(),
-    DATEDIFF(NOW(), created_at)
+    DATEDIFF(NOW(), created_at),
+    DECODE(priority, 'H', 'High', 'M', 'Medium', 'Low'),
+    FROM_UTC_TIMESTAMP(event_ts, 'US/Pacific')
 FROM db.events
+LEFT SEMI JOIN db.valid_events ON db.events.event_id = db.valid_events.event_id
 LATERAL VIEW EXPLODE(tags) t_tags AS tag
 WHERE payload RLIKE '^ERR.*'
 GROUP BY event_id;
@@ -1054,6 +1432,19 @@ def _self_test():
           "[sql impala] STORED AS not handled")
     # SQL comments must still be there
     check('-- Raw Impala SQL file' in result4,  "[sql impala] SQL comment was mangled")
+    # New rules
+    check("CASE WHEN status = 1 THEN 'active'" in result4,
+          "[sql impala] DECODE not converted to CASE")
+    check('NULLIF(balance, 0)' in result4,
+          "[sql impala] NULLIFZERO not converted")
+    check('COALESCE(quantity, 0)' in result4,
+          "[sql impala] ZEROIFNULL not converted")
+    check('AT TIME ZONE' in result4,
+          "[sql impala] FROM_UTC_TIMESTAMP not converted")
+    check('TODO' in result4 and 'SEMI JOIN' in result4,
+          "[sql impala] LEFT SEMI JOIN not flagged")
+    check("REGEXP_LIKE(name, '^[A-Z].*')" in result4,
+          "[sql impala] REGEXP not converted to REGEXP_LIKE")
 
     # ─── TEST 5: --!hive .sql → --!presto (raw SQL) ──────────────────
     print(f"\n{SEP}")
@@ -1075,6 +1466,13 @@ def _self_test():
     check('REGEXP_LIKE(' in result5,           "[sql hive] RLIKE not converted")
     check('CROSS JOIN UNNEST(' in result5,     "[sql hive] LATERAL VIEW EXPLODE not converted")
     check('-- Raw Hive SQL file' in result5,   "[sql hive] SQL comment was mangled")
+    # New rules
+    check("CASE WHEN priority = 'H' THEN 'High'" in result5,
+          "[sql hive] DECODE not converted to CASE")
+    check('AT TIME ZONE' in result5,
+          "[sql hive] FROM_UTC_TIMESTAMP not converted")
+    check('TODO' in result5 and 'SEMI JOIN' in result5,
+          "[sql hive] LEFT SEMI JOIN not flagged")
 
     # ─── TEST 6: --!null .sql → no conversion ────────────────────────
     print(f"\n{SEP}")
