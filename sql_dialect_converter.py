@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """
-SQL Dialect Converter for Nashorn JavaScript Files
-====================================================
-Reads a dialect label near the top of each .js file:
+SQL Dialect Converter for Nashorn JavaScript and Raw SQL Files
+===============================================================
+Reads a dialect label near the top of each file:
 
     --!impala   →  converts Impala SQL to Trino,  relabels --!trino
     --!hive     →  converts Hive  SQL to Presto,  relabels --!presto
     --!null     →  no conversion, file is left untouched
 
+Supported file types:
+    .js         →  Nashorn JS with embedded SQL in string literals
+    .sql .hql .hive .ddl .dml  →  raw SQL (rules applied to entire content)
+
 All JavaScript / Nashorn scripting is preserved exactly as-is;
-only the SQL content inside string literals is rewritten.
+only the SQL content is rewritten.
 
 Usage:
-    python sql_dialect_converter.py input.js -o output.js
+    python sql_dialect_converter.py input.js  -o output.js
+    python sql_dialect_converter.py input.sql -o output.sql
     python sql_dialect_converter.py input_dir/ -o output_dir/ --recursive
-    python sql_dialect_converter.py input.js --dry-run
+    python sql_dialect_converter.py input.sql --dry-run
     python sql_dialect_converter.py --self-test
 """
 
@@ -531,7 +536,12 @@ def find_sql_strings(source: str) -> list[StringLiteral]:
 #  FILE CONVERTER  (now dialect-aware)
 # ===========================================================================
 
-class NashornFileConverter:
+class FileConverter:
+
+    # File extensions treated as raw SQL (rules applied to entire content).
+    # Everything else (e.g. .js) is treated as a script with embedded SQL
+    # inside string literals.
+    RAW_SQL_EXTENSIONS = {'.sql', '.hql', '.hive', '.ddl', '.dml'}
 
     def convert_file(self, source: str,
                      filepath: str = "<stdin>") -> tuple[str, ConversionReport]:
@@ -571,7 +581,42 @@ class NashornFileConverter:
         converter_cls = _CONVERTERS[dialect]
         converter = converter_cls()
 
-        # 4. Find and convert SQL strings
+        # 4. Choose conversion strategy based on file type
+        ext = Path(filepath).suffix.lower()
+        if ext in self.RAW_SQL_EXTENSIONS:
+            result = self._convert_raw_sql(source, converter, report)
+        else:
+            result = self._convert_embedded_sql(source, converter, report)
+
+        # 5. Replace the dialect label
+        old_label = label_match.group(0)   # e.g. "--!impala"
+        result = result.replace(old_label, new_label, 1)
+
+        return result, report
+
+    @staticmethod
+    def _convert_raw_sql(source: str, converter: SQLConverter,
+                         report: ConversionReport) -> str:
+        """
+        For .sql / .hql / .ddl files: apply conversion rules directly
+        to the entire file content (the SQL is raw text, not inside
+        JS string literals).
+        """
+        report.strings_found = 1   # treat whole file as one SQL block
+        converted, rules = converter.convert(source)
+        if rules:
+            report.strings_changed = 1
+            report.rules_applied.extend(rules)
+            return converted
+        return source
+
+    @staticmethod
+    def _convert_embedded_sql(source: str, converter: SQLConverter,
+                              report: ConversionReport) -> str:
+        """
+        For .js (Nashorn) files: scan for SQL inside JS string literals,
+        convert each one independently, and rebuild the source.
+        """
         sql_strings = find_sql_strings(source)
         report.strings_found = len(sql_strings)
 
@@ -582,7 +627,7 @@ class NashornFileConverter:
                 report.strings_changed += 1
                 report.rules_applied.extend(rules)
 
-        # 5. Rebuild source – replace SQL in reverse offset order
+        # Rebuild – replace in reverse offset order so positions stay valid
         result = source
         for lit in sorted(sql_strings, key=lambda l: l.start, reverse=True):
             if not lit.converted or lit.converted == lit.unescaped:
@@ -591,11 +636,7 @@ class NashornFileConverter:
             replacement = f'{lit.quote}{escaped}{lit.quote}'
             result = result[:lit.start] + replacement + result[lit.end:]
 
-        # 6. Replace the dialect label
-        old_label = label_match.group(0)   # e.g. "--!impala"
-        result = result.replace(old_label, new_label, 1)
-
-        return result, report
+        return result
 
 
 # ===========================================================================
@@ -604,7 +645,7 @@ class NashornFileConverter:
 
 def process_file(input_path: str, output_path: Optional[str],
                  dry_run: bool = False) -> ConversionReport:
-    converter = NashornFileConverter()
+    converter = FileConverter()
     with open(input_path, 'r', encoding='utf-8') as f:
         source = f.read()
 
@@ -635,21 +676,23 @@ def process_file(input_path: str, output_path: Optional[str],
 
 def process_directory(input_dir: str, output_dir: str,
                       recursive: bool, dry_run: bool) -> list[ConversionReport]:
-    pattern = '**/*.js' if recursive else '*.js'
     reports = []
-    for js_file in sorted(Path(input_dir).glob(pattern)):
-        rel = js_file.relative_to(input_dir)
-        out = str(Path(output_dir) / rel)
-        reports.append(process_file(str(js_file), out, dry_run))
+    extensions = ('*.js', '*.sql', '*.hql', '*.hive', '*.ddl', '*.dml')
+    for ext in extensions:
+        pattern = f'**/{ext}' if recursive else ext
+        for fpath in sorted(Path(input_dir).glob(pattern)):
+            rel = fpath.relative_to(input_dir)
+            out = str(Path(output_dir) / rel)
+            reports.append(process_file(str(fpath), out, dry_run))
     return reports
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert SQL dialects in Nashorn JS files based on "
+        description="Convert SQL dialects in .js and .sql files based on "
                     "--!impala / --!hive / --!null labels."
     )
-    parser.add_argument("input", nargs='?', help="Input .js file or directory")
+    parser.add_argument("input", nargs='?', help="Input .js/.sql file or directory")
     parser.add_argument("-o", "--output", help="Output file or directory")
     parser.add_argument("-r", "--recursive", action="store_true")
     parser.add_argument("-n", "--dry-run", action="store_true",
@@ -810,9 +853,51 @@ function doStuff() {
 }
 '''
 
+SAMPLE_IMPALA_SQL = """\
+--!impala
+-- Raw Impala SQL file
+CREATE TABLE db.target (
+    id BIGINT,
+    name STRING,
+    score FLOAT
+) STORED AS PARQUET;
+
+INSERT OVERWRITE TABLE db.target
+SELECT id,
+       NVL(name, 'unknown'),
+       CAST(score AS STRING),
+       TO_DATE(created_ts),
+       GROUP_CONCAT(`status`)
+FROM db.source
+WHERE DATEDIFF(NOW(), created_ts) <= 30;
+
+COMPUTE STATS db.target;
+"""
+
+SAMPLE_HIVE_SQL = """\
+--!hive
+-- Raw Hive SQL file
+SELECT
+    event_id,
+    COLLECT_LIST(payload),
+    SIZE(tags),
+    UNIX_TIMESTAMP(),
+    DATEDIFF(NOW(), created_at)
+FROM db.events
+LATERAL VIEW EXPLODE(tags) t_tags AS tag
+WHERE payload RLIKE '^ERR.*'
+GROUP BY event_id;
+"""
+
+SAMPLE_NULL_SQL = """\
+--!null
+-- This SQL file should not be converted
+SELECT NVL(a, 0), CAST(b AS STRING) FROM my_table;
+"""
+
 
 def _self_test():
-    converter = NashornFileConverter()
+    converter = FileConverter()
     all_errors = []
 
     def check(cond, msg):
@@ -821,9 +906,9 @@ def _self_test():
 
     SEP = "=" * 70
 
-    # ─── TEST 1: --!impala → --!trino ────────────────────────────────
+    # ─── TEST 1: --!impala .js → --!trino ────────────────────────────
     print(f"\n{SEP}")
-    print("  TEST 1: --!impala → --!trino")
+    print("  TEST 1: --!impala .js → --!trino")
     print(SEP)
 
     result, report = converter.convert_file(SAMPLE_IMPALA, "impala_etl.js")
@@ -862,9 +947,9 @@ def _self_test():
     check('REMOVED' in result and 'COMPUTE STATS' in result,
           "[impala] COMPUTE STATS not removed")
 
-    # ─── TEST 2: --!hive → --!presto ────────────────────────────────
+    # ─── TEST 2: --!hive .js → --!presto ────────────────────────────
     print(f"\n{SEP}")
-    print("  TEST 2: --!hive → --!presto")
+    print("  TEST 2: --!hive .js → --!presto")
     print(SEP)
 
     result2, report2 = converter.convert_file(SAMPLE_HIVE, "hive_etl.js")
@@ -899,19 +984,83 @@ def _self_test():
     check('STORED AS ORC' not in result2 or 'adjust for Presto' in result2,
           "[hive] STORED AS not handled")
 
-    # ─── TEST 3: --!null → no conversion ─────────────────────────────
+    # ─── TEST 3: --!null .js → no conversion ─────────────────────────
     print(f"\n{SEP}")
-    print("  TEST 3: --!null → no conversion")
+    print("  TEST 3: --!null .js → no conversion")
     print(SEP)
 
     result3, report3 = converter.convert_file(SAMPLE_NULL, "null_file.js")
     print(f"  Dialect: {report3.dialect}")
     print(f"  Skipped: {report3.skipped}")
 
-    check(report3.skipped is True,            "[null] file was not skipped")
-    check(result3 == SAMPLE_NULL,             "[null] file content was modified")
-    check('--!null' in result3,               "[null] label was changed")
-    check('SELECT * FROM whatever' in result3,"[null] SQL was modified")
+    check(report3.skipped is True,            "[null js] file was not skipped")
+    check(result3 == SAMPLE_NULL,             "[null js] file content was modified")
+    check('--!null' in result3,               "[null js] label was changed")
+    check('SELECT * FROM whatever' in result3,"[null js] SQL was modified")
+
+    # ─── TEST 4: --!impala .sql → --!trino (raw SQL) ─────────────────
+    print(f"\n{SEP}")
+    print("  TEST 4: --!impala .sql → --!trino (raw SQL file)")
+    print(SEP)
+
+    result4, report4 = converter.convert_file(SAMPLE_IMPALA_SQL, "etl_impala.sql")
+    print(f"  Dialect: {report4.dialect} → {report4.target}")
+    print(f"  Strings changed: {report4.strings_changed}")
+    for rule in sorted(set(report4.rules_applied)):
+        print(f"    ✓ {rule}")
+
+    check('--!trino' in result4,                "[sql impala] label not changed to --!trino")
+    check('--!impala' not in result4,           "[sql impala] old label still present")
+    check('VARCHAR' in result4,                 "[sql impala] STRING not converted")
+    check('REAL' in result4,                    "[sql impala] FLOAT not converted")
+    check('COALESCE(' in result4,               "[sql impala] NVL not converted")
+    check('CAST(score AS VARCHAR)' in result4,  "[sql impala] CAST AS STRING not converted")
+    check('CAST(created_ts AS DATE)' in result4,"[sql impala] TO_DATE not converted")
+    check("DATE_DIFF('day'" in result4,         "[sql impala] DATEDIFF not converted")
+    check('INSERT INTO' in result4,             "[sql impala] INSERT OVERWRITE not converted")
+    check('ARRAY_JOIN(ARRAY_AGG(' in result4,   "[sql impala] GROUP_CONCAT not converted")
+    check('REMOVED' in result4 and 'COMPUTE STATS' in result4,
+          "[sql impala] COMPUTE STATS not removed")
+    check('STORED AS PARQUET' not in result4 or 'adjust for Trino' in result4,
+          "[sql impala] STORED AS not handled")
+    # SQL comments must still be there
+    check('-- Raw Impala SQL file' in result4,  "[sql impala] SQL comment was mangled")
+
+    # ─── TEST 5: --!hive .sql → --!presto (raw SQL) ──────────────────
+    print(f"\n{SEP}")
+    print("  TEST 5: --!hive .sql → --!presto (raw SQL file)")
+    print(SEP)
+
+    result5, report5 = converter.convert_file(SAMPLE_HIVE_SQL, "etl_hive.sql")
+    print(f"  Dialect: {report5.dialect} → {report5.target}")
+    print(f"  Strings changed: {report5.strings_changed}")
+    for rule in sorted(set(report5.rules_applied)):
+        print(f"    ✓ {rule}")
+
+    check('--!presto' in result5,              "[sql hive] label not changed to --!presto")
+    check('--!hive' not in result5,            "[sql hive] old label still present")
+    check('ARRAY_AGG(' in result5,             "[sql hive] COLLECT_LIST not converted")
+    check('CARDINALITY(' in result5,           "[sql hive] SIZE not converted")
+    check('TO_UNIXTIME(NOW())' in result5,     "[sql hive] UNIX_TIMESTAMP not converted")
+    check("DATE_DIFF('day'" in result5,        "[sql hive] DATEDIFF not converted")
+    check('REGEXP_LIKE(' in result5,           "[sql hive] RLIKE not converted")
+    check('CROSS JOIN UNNEST(' in result5,     "[sql hive] LATERAL VIEW EXPLODE not converted")
+    check('-- Raw Hive SQL file' in result5,   "[sql hive] SQL comment was mangled")
+
+    # ─── TEST 6: --!null .sql → no conversion ────────────────────────
+    print(f"\n{SEP}")
+    print("  TEST 6: --!null .sql → no conversion")
+    print(SEP)
+
+    result6, report6 = converter.convert_file(SAMPLE_NULL_SQL, "etl_null.sql")
+    print(f"  Dialect: {report6.dialect}")
+    print(f"  Skipped: {report6.skipped}")
+
+    check(report6.skipped is True,            "[null sql] file was not skipped")
+    check(result6 == SAMPLE_NULL_SQL,         "[null sql] file content was modified")
+    check('--!null' in result6,               "[null sql] label was changed")
+    check('NVL(a, 0)' in result6,             "[null sql] SQL was modified")
+    check('CAST(b AS STRING)' in result6,     "[null sql] SQL was modified")
 
     # ─── RESULTS ─────────────────────────────────────────────────────
     print(f"\n{SEP}")
@@ -922,9 +1071,12 @@ def _self_test():
         print(SEP)
         sys.exit(1)
     else:
-        print("  ✅ TEST 1 PASSED – --!impala → --!trino  (Impala SQL → Trino)")
-        print("  ✅ TEST 2 PASSED – --!hive   → --!presto (Hive SQL  → Presto)")
-        print("  ✅ TEST 3 PASSED – --!null   → skipped   (no conversion)")
+        print("  ✅ TEST 1 PASSED – --!impala .js  → --!trino  (embedded SQL → Trino)")
+        print("  ✅ TEST 2 PASSED – --!hive   .js  → --!presto (embedded SQL → Presto)")
+        print("  ✅ TEST 3 PASSED – --!null   .js  → skipped")
+        print("  ✅ TEST 4 PASSED – --!impala .sql → --!trino  (raw SQL → Trino)")
+        print("  ✅ TEST 5 PASSED – --!hive   .sql → --!presto (raw SQL → Presto)")
+        print("  ✅ TEST 6 PASSED – --!null   .sql → skipped")
         print(SEP + "\n")
 
 
