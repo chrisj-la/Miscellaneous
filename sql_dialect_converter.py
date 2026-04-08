@@ -93,6 +93,33 @@ def detect_dialect(source: str, scan_lines: int = 30) -> Optional[re.Match]:
 
 
 # ===========================================================================
+#  BALANCED-PARENTHESIS PATTERN HELPERS
+# ===========================================================================
+# Many SQL functions nest other function calls in their arguments, e.g.
+#   TO_DATE(TRUNC(ts, 'MM'))    DATEDIFF(NOW(), TRUNC(ts, 'DD'))
+#
+# A naïve [^)]+ or [^,]+ breaks on the inner parentheses.  The patterns
+# below match arguments with up to 2 levels of nested parens AND handle
+# single-quoted strings at every level (important because TRUNC→DATE_TRUNC
+# rewrites introduce quotes like DATE_TRUNC('mm', col) inside outer calls).
+
+# Quoted string literal (SQL uses single quotes)
+_Q = r"'[^']*'"
+
+# Level 0 (innermost parens): no further nesting, but allow quoted strings
+_L0 = rf"(?:[^()']*|{_Q})*"
+
+# Level 1: one level of nested parens + quoted strings
+_L1 = rf"(?:[^()']*|\({_L0}\)|{_Q})*"
+
+# SINGLE function argument (stops at unbalanced comma).  2 nesting levels.
+_ARG = rf"(?:[^(),']*|\({_L1}\)|{_Q})*"
+
+# FULL body inside outermost parens (commas allowed).  2 nesting levels.
+_BODY = rf"(?:[^()']*|\({_L1}\)|{_Q})*"
+
+
+# ===========================================================================
 #  BASE CONVERTER – shared rule engine
 # ===========================================================================
 
@@ -144,7 +171,7 @@ class ImpalaToTrinoConverter(SQLConverter):
 
         # ── Data types ─────────────────────────────────────────────────
         _add(r, "CAST(... AS STRING) → CAST(... AS VARCHAR)",
-             r"\bCAST\s*\(\s*([^)]+?)\s+AS\s+STRING\s*\)",
+             r"\bCAST\s*\(\s*(" + _BODY + r")\s+AS\s+STRING\s*\)",
              lambda m: f"CAST({m.group(1).strip()} AS VARCHAR)")
         _add(r, "Type STRING → VARCHAR",
              r"(?<=[\s,(])STRING(?=[\s,)])", "VARCHAR")
@@ -183,13 +210,13 @@ class ImpalaToTrinoConverter(SQLConverter):
         _add(r, "NVL → COALESCE",
              r"\bNVL\s*\(", "COALESCE(")
         _add(r, "NVL2(e,a,b) → IF(e IS NOT NULL, a, b)",
-             r"\bNVL2\s*\(\s*([^,]+?)\s*,\s*([^,]+?)\s*,\s*([^)]+?)\s*\)",
+             r"\bNVL2\s*\(\s*(" + _ARG + r")\s*,\s*(" + _ARG + r")\s*,\s*(" + _ARG + r")\s*\)",
              lambda m: f"IF({m.group(1).strip()} IS NOT NULL, "
                         f"{m.group(2).strip()}, {m.group(3).strip()})")
         _add(r, "IFNULL → COALESCE",
              r"\bIFNULL\s*\(", "COALESCE(")
         _add(r, "GROUP_CONCAT → ARRAY_JOIN(ARRAY_AGG(...))",
-             r"\bGROUP_CONCAT\s*\(\s*([^,)]+?)\s*(?:,\s*'([^']*)'\s*)?\)",
+             r"\bGROUP_CONCAT\s*\(\s*(" + _ARG + r")\s*(?:,\s*'([^']*)'\s*)?\)",
              lambda m: f"ARRAY_JOIN(ARRAY_AGG({m.group(1).strip()}), "
                         f"'{m.group(2) if m.group(2) else ','}')")
 
@@ -201,35 +228,35 @@ class ImpalaToTrinoConverter(SQLConverter):
         _add(r, "FROM_TIMESTAMP → DATE_FORMAT",
              r"\bFROM_TIMESTAMP\s*\(", "DATE_FORMAT(")
         _add(r, "TO_DATE(expr) → CAST(expr AS DATE)",
-             r"\bTO_DATE\s*\(\s*([^)]+?)\s*\)",
+             r"\bTO_DATE\s*\(\s*(" + _BODY + r")\s*\)",
              lambda m: f"CAST({m.group(1).strip()} AS DATE)")
         _add(r, "DATEDIFF(a,b) → DATE_DIFF('day', b, a)",
-             r"\bDATEDIFF\s*\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)",
+             r"\bDATEDIFF\s*\(\s*(" + _ARG + r")\s*,\s*(" + _ARG + r")\s*\)",
              lambda m: f"DATE_DIFF('day', {m.group(2).strip()}, {m.group(1).strip()})")
         _add(r, "DATE_ADD(d, n) → DATE_ADD('day', n, d)",
-             r"\bDATE_ADD\s*\(\s*([^,]+?)\s*,\s*(?:INTERVAL\s+)?([^)]+?)\s*\)",
+             r"\bDATE_ADD\s*\(\s*(" + _ARG + r")\s*,\s*(?:INTERVAL\s+)?(" + _ARG + r")\s*\)",
              lambda m: f"DATE_ADD('day', {m.group(2).strip()}, {m.group(1).strip()})")
         _add(r, "DATE_SUB(d, n) → DATE_ADD('day', -n, d)",
-             r"\bDATE_SUB\s*\(\s*([^,]+?)\s*,\s*(?:INTERVAL\s+)?([^)]+?)\s*\)",
+             r"\bDATE_SUB\s*\(\s*(" + _ARG + r")\s*,\s*(?:INTERVAL\s+)?(" + _ARG + r")\s*\)",
              lambda m: f"DATE_ADD('day', -({m.group(2).strip()}), {m.group(1).strip()})")
         _add(r, "ADD_MONTHS(d, n) → DATE_ADD('month', n, d)",
-             r"\bADD_MONTHS\s*\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)",
+             r"\bADD_MONTHS\s*\(\s*(" + _ARG + r")\s*,\s*(" + _ARG + r")\s*\)",
              lambda m: f"DATE_ADD('month', {m.group(2).strip()}, {m.group(1).strip()})")
         _add(r, "MONTHS_BETWEEN(a,b) → DATE_DIFF('month', b, a)",
-             r"\bMONTHS_BETWEEN\s*\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)",
+             r"\bMONTHS_BETWEEN\s*\(\s*(" + _ARG + r")\s*,\s*(" + _ARG + r")\s*\)",
              lambda m: f"DATE_DIFF('month', {m.group(2).strip()}, {m.group(1).strip()})")
         _add(r, "TRUNC(d, fmt) → DATE_TRUNC(fmt, d)",
-             r"\bTRUNC\s*\(\s*([^,]+?)\s*,\s*'([^']+)'\s*\)",
+             r"\bTRUNC\s*\(\s*(" + _ARG + r")\s*,\s*'([^']+)'\s*\)",
              lambda m: f"DATE_TRUNC('{m.group(2).strip().lower()}', {m.group(1).strip()})")
         _add(r, "CURRENT_TIMESTAMP() → NOW()",
              r"\bCURRENT_TIMESTAMP\s*\(\s*\)", "NOW()")
 
         # String
         _add(r, "STRLEFT(s,n) → SUBSTR(s,1,n)",
-             r"\bSTRLEFT\s*\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)",
+             r"\bSTRLEFT\s*\(\s*(" + _ARG + r")\s*,\s*(" + _ARG + r")\s*\)",
              lambda m: f"SUBSTR({m.group(1).strip()}, 1, {m.group(2).strip()})")
         _add(r, "STRRIGHT(s,n) → SUBSTR(s,-n)",
-             r"\bSTRRIGHT\s*\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)",
+             r"\bSTRRIGHT\s*\(\s*(" + _ARG + r")\s*,\s*(" + _ARG + r")\s*\)",
              lambda m: f"SUBSTR({m.group(1).strip()}, -{m.group(2).strip()})")
         _add(r, "INSTR → STRPOS",
              r"\bINSTR\s*\(", "STRPOS(")
@@ -238,7 +265,7 @@ class ImpalaToTrinoConverter(SQLConverter):
         _add(r, "FNV_HASH → XXHASH64",
              r"\bFNV_HASH\s*\(", "XXHASH64(")
         _add(r, "PMOD(a,b) → ((a%b)+b)%b",
-             r"\bPMOD\s*\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)",
+             r"\bPMOD\s*\(\s*(" + _ARG + r")\s*,\s*(" + _ARG + r")\s*\)",
              lambda m: f"(({m.group(1).strip()} % {m.group(2).strip()}) "
                         f"+ {m.group(2).strip()}) % {m.group(2).strip()}")
 
@@ -274,7 +301,7 @@ class HiveToPrestoConverter(SQLConverter):
 
         # ── Data types ─────────────────────────────────────────────────
         _add(r, "CAST(... AS STRING) → CAST(... AS VARCHAR)",
-             r"\bCAST\s*\(\s*([^)]+?)\s+AS\s+STRING\s*\)",
+             r"\bCAST\s*\(\s*(" + _BODY + r")\s+AS\s+STRING\s*\)",
              lambda m: f"CAST({m.group(1).strip()} AS VARCHAR)")
         _add(r, "Type STRING → VARCHAR",
              r"(?<=[\s,(])STRING(?=[\s,)])", "VARCHAR")
@@ -338,50 +365,44 @@ class HiveToPrestoConverter(SQLConverter):
              r"\bSORT_ARRAY\s*\(", "ARRAY_SORT(")
         _add(r, "ARRAY_CONTAINS(arr,val) → CONTAINS(arr,val)",
              r"\bARRAY_CONTAINS\s*\(", "CONTAINS(")
-        _add(r, "CONCAT_WS stays the same (both support it)",
-             r"placeholder_no_match_xyzzy", "")  # doc-only
 
         # String
         _add(r, "INSTR → STRPOS",
              r"\bINSTR\s*\(", "STRPOS(")
-        _add(r, "LENGTH → LENGTH (same)", r"placeholder_len_xyzzy", "")
         _add(r, "LOCATE(needle,hay) → STRPOS(hay,needle)",
-             r"\bLOCATE\s*\(\s*([^,]+?)\s*,\s*([^),]+?)\s*\)",
+             r"\bLOCATE\s*\(\s*(" + _ARG + r")\s*,\s*(" + _ARG + r")\s*\)",
              lambda m: f"STRPOS({m.group(2).strip()}, {m.group(1).strip()})")
 
         # Regex
         _add(r, "RLIKE → REGEXP_LIKE",
              r"\b(\S+)\s+RLIKE\s+'([^']+)'",
              lambda m: f"REGEXP_LIKE({m.group(1).strip()}, '{m.group(2)}')")
-        _add(r, "REGEXP_EXTRACT(s,pat,idx) stays same in Presto",
-             r"placeholder_regexp_xyzzy", "")
 
         # Date / time
         _add(r, "UNIX_TIMESTAMP() → TO_UNIXTIME(NOW())",
              r"\bUNIX_TIMESTAMP\s*\(\s*\)", "TO_UNIXTIME(NOW())")
         _add(r, "UNIX_TIMESTAMP(expr) → TO_UNIXTIME(",
              r"\bUNIX_TIMESTAMP\s*\(", "TO_UNIXTIME(")
-        _add(r, "FROM_UNIXTIME stays same", r"placeholder_fux_xyzzy", "")
         _add(r, "TO_DATE(expr) → CAST(expr AS DATE)",
-             r"\bTO_DATE\s*\(\s*([^)]+?)\s*\)",
+             r"\bTO_DATE\s*\(\s*(" + _BODY + r")\s*\)",
              lambda m: f"CAST({m.group(1).strip()} AS DATE)")
         _add(r, "DATEDIFF(a,b) → DATE_DIFF('day', b, a)",
-             r"\bDATEDIFF\s*\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)",
+             r"\bDATEDIFF\s*\(\s*(" + _ARG + r")\s*,\s*(" + _ARG + r")\s*\)",
              lambda m: f"DATE_DIFF('day', {m.group(2).strip()}, {m.group(1).strip()})")
         _add(r, "DATE_ADD(d, n) → DATE_ADD('day', n, d)",
-             r"\bDATE_ADD\s*\(\s*([^,]+?)\s*,\s*(?:INTERVAL\s+)?([^)]+?)\s*\)",
+             r"\bDATE_ADD\s*\(\s*(" + _ARG + r")\s*,\s*(?:INTERVAL\s+)?(" + _ARG + r")\s*\)",
              lambda m: f"DATE_ADD('day', {m.group(2).strip()}, {m.group(1).strip()})")
         _add(r, "DATE_SUB(d, n) → DATE_ADD('day', -n, d)",
-             r"\bDATE_SUB\s*\(\s*([^,]+?)\s*,\s*(?:INTERVAL\s+)?([^)]+?)\s*\)",
+             r"\bDATE_SUB\s*\(\s*(" + _ARG + r")\s*,\s*(?:INTERVAL\s+)?(" + _ARG + r")\s*\)",
              lambda m: f"DATE_ADD('day', -({m.group(2).strip()}), {m.group(1).strip()})")
         _add(r, "ADD_MONTHS(d, n) → DATE_ADD('month', n, d)",
-             r"\bADD_MONTHS\s*\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)",
+             r"\bADD_MONTHS\s*\(\s*(" + _ARG + r")\s*,\s*(" + _ARG + r")\s*\)",
              lambda m: f"DATE_ADD('month', {m.group(2).strip()}, {m.group(1).strip()})")
         _add(r, "MONTHS_BETWEEN(a,b) → DATE_DIFF('month', b, a)",
-             r"\bMONTHS_BETWEEN\s*\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)",
+             r"\bMONTHS_BETWEEN\s*\(\s*(" + _ARG + r")\s*,\s*(" + _ARG + r")\s*\)",
              lambda m: f"DATE_DIFF('month', {m.group(2).strip()}, {m.group(1).strip()})")
         _add(r, "TRUNC(d, fmt) → DATE_TRUNC(fmt, d)",
-             r"\bTRUNC\s*\(\s*([^,]+?)\s*,\s*'([^']+)'\s*\)",
+             r"\bTRUNC\s*\(\s*(" + _ARG + r")\s*,\s*'([^']+)'\s*\)",
              lambda m: f"DATE_TRUNC('{m.group(2).strip().lower()}', {m.group(1).strip()})")
         _add(r, "CURRENT_TIMESTAMP() → NOW()",
              r"\bCURRENT_TIMESTAMP\s*\(\s*\)", "NOW()")
@@ -392,17 +413,17 @@ class HiveToPrestoConverter(SQLConverter):
 
         # Math
         _add(r, "PMOD(a,b) → ((a%b)+b)%b",
-             r"\bPMOD\s*\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)",
+             r"\bPMOD\s*\(\s*(" + _ARG + r")\s*,\s*(" + _ARG + r")\s*\)",
              lambda m: f"(({m.group(1).strip()} % {m.group(2).strip()}) "
                         f"+ {m.group(2).strip()}) % {m.group(2).strip()}")
 
         # LATERAL VIEW EXPLODE → CROSS JOIN UNNEST
         _add(r, "LATERAL VIEW EXPLODE(col) t AS c → CROSS JOIN UNNEST(col) AS t(c)",
-             r"\bLATERAL\s+VIEW\s+EXPLODE\s*\(\s*([^)]+?)\s*\)\s+(\w+)\s+AS\s+(\w+)",
+             r"\bLATERAL\s+VIEW\s+EXPLODE\s*\(\s*(" + _BODY + r")\s*\)\s+(\w+)\s+AS\s+(\w+)",
              lambda m: f"CROSS JOIN UNNEST({m.group(1).strip()}) "
                         f"AS {m.group(2).strip()}({m.group(3).strip()})")
         _add(r, "LATERAL VIEW POSEXPLODE(col) t AS p,c → CROSS JOIN UNNEST(col) WITH ORDINALITY AS t(c,p)",
-             r"\bLATERAL\s+VIEW\s+POSEXPLODE\s*\(\s*([^)]+?)\s*\)\s+(\w+)\s+AS\s+(\w+)\s*,\s*(\w+)",
+             r"\bLATERAL\s+VIEW\s+POSEXPLODE\s*\(\s*(" + _BODY + r")\s*\)\s+(\w+)\s+AS\s+(\w+)\s*,\s*(\w+)",
              lambda m: f"CROSS JOIN UNNEST({m.group(1).strip()}) WITH ORDINALITY "
                         f"AS {m.group(2).strip()}({m.group(4).strip()}, {m.group(3).strip()})")
 
@@ -867,7 +888,9 @@ SELECT id,
        NVL(name, 'unknown'),
        CAST(score AS STRING),
        TO_DATE(created_ts),
-       GROUP_CONCAT(`status`)
+       TO_DATE(TRUNC(mn.admissiondate, 'MM')),
+       GROUP_CONCAT(`status`),
+       DATEDIFF(NOW(), TRUNC(ts, 'DD'))
 FROM db.source
 WHERE DATEDIFF(NOW(), created_ts) <= 30;
 
@@ -1016,6 +1039,12 @@ def _self_test():
     check('COALESCE(' in result4,               "[sql impala] NVL not converted")
     check('CAST(score AS VARCHAR)' in result4,  "[sql impala] CAST AS STRING not converted")
     check('CAST(created_ts AS DATE)' in result4,"[sql impala] TO_DATE not converted")
+    # The user's exact failing case: nested TRUNC inside TO_DATE
+    check("CAST(DATE_TRUNC('mm', mn.admissiondate) AS DATE)" in result4,
+          "[sql impala] TO_DATE(TRUNC(...)) nested parens broken")
+    # Nested TRUNC inside DATEDIFF second argument
+    check("DATE_DIFF('day', DATE_TRUNC('dd', ts), NOW())" in result4,
+          "[sql impala] DATEDIFF(NOW(), TRUNC(...)) nested parens broken")
     check("DATE_DIFF('day'" in result4,         "[sql impala] DATEDIFF not converted")
     check('INSERT INTO' in result4,             "[sql impala] INSERT OVERWRITE not converted")
     check('ARRAY_JOIN(ARRAY_AGG(' in result4,   "[sql impala] GROUP_CONCAT not converted")
