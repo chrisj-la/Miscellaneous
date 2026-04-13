@@ -83,7 +83,7 @@ DIALECT_MAP = {
 }
 
 
-def detect_dialect(source: str, scan_lines: int = 30) -> Optional[re.Match]:
+def detect_dialect(source, scan_lines=30):
     """
     Scan the first *scan_lines* lines of source for a --!<dialect> label.
     Returns the regex Match object (so we know position + dialect), or None.
@@ -230,7 +230,7 @@ def _find_balanced_parens(s, start):
     return -1
 
 
-def _decode_to_case(m: re.Match) -> str:
+def _decode_to_case(m):
     """
     Convert DECODE(expr, search1, result1 [, search2, result2 ...] [, default])
     to CASE WHEN expr = search1 THEN result1 ... ELSE default END.
