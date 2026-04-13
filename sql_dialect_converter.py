@@ -29,8 +29,7 @@ import sys
 import argparse
 import logging
 from pathlib import Path
-from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List, Tuple
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
@@ -40,27 +39,30 @@ log = logging.getLogger(__name__)
 #  DATA TYPES
 # ===========================================================================
 
-@dataclass
 class StringLiteral:
     """A JS string literal found in the source."""
-    start: int
-    end: int
-    quote: str
-    raw: str
-    unescaped: str
-    is_sql: bool = False
-    converted: str = ""
+    def __init__(self, start, end, quote, raw, unescaped,
+                 is_sql=False, converted=""):
+        self.start = start
+        self.end = end
+        self.quote = quote
+        self.raw = raw
+        self.unescaped = unescaped
+        self.is_sql = is_sql
+        self.converted = converted
 
 
-@dataclass
 class ConversionReport:
-    file: str
-    dialect: str = ""
-    target: str = ""
-    strings_found: int = 0
-    strings_changed: int = 0
-    rules_applied: list = field(default_factory=list)
-    skipped: bool = False
+    def __init__(self, file, dialect="", target="",
+                 strings_found=0, strings_changed=0,
+                 rules_applied=None, skipped=False):
+        self.file = file
+        self.dialect = dialect
+        self.target = target
+        self.strings_found = strings_found
+        self.strings_changed = strings_changed
+        self.rules_applied = rules_applied if rules_applied is not None else []
+        self.skipped = skipped
 
 
 # ===========================================================================
@@ -132,12 +134,14 @@ class SQLConverter:
     def _build_rules(self):
         raise NotImplementedError
 
-    def _pre_passes(self, sql: str) -> tuple[str, list[str]]:
+    def _pre_passes(self, sql):
+        # type: (str) -> Tuple[str, List[str]]
         """Override in subclasses for complex rewrites that can't be done
         with simple regex sub (e.g. DECODE with variable args)."""
         return sql, []
 
-    def convert(self, sql: str) -> tuple[str, list[str]]:
+    def convert(self, sql):
+        # type: (str) -> Tuple[str, List[str]]
         applied = []
         result = sql
 
@@ -164,7 +168,8 @@ def _add(rules, desc, pattern, repl, flags=re.IGNORECASE):
 #  Complex rewrite helpers (used as callables inside rules)
 # ---------------------------------------------------------------------------
 
-def _extract_balanced_args(s: str) -> list[str]:
+def _extract_balanced_args(s):
+    # type: (str) -> List[str]
     """
     Split a string by top-level commas, respecting nested parens and quotes.
     e.g. "a, FUNC(b, c), 'x,y'" → ["a", "FUNC(b, c)", "'x,y'"]
@@ -201,7 +206,8 @@ def _extract_balanced_args(s: str) -> list[str]:
     return args
 
 
-def _find_balanced_parens(s: str, start: int) -> int:
+def _find_balanced_parens(s, start):
+    # type: (str, int) -> int
     """
     Given s and the index of an opening '(', return the index of the
     matching closing ')'.  Returns -1 if unbalanced.
@@ -268,7 +274,8 @@ def _decode_to_case(m: re.Match) -> str:
     return ' '.join(parts)
 
 
-def _decode_prepass(sql: str) -> tuple[str, bool]:
+def _decode_prepass(sql):
+    # type: (str) -> Tuple[str, bool]
     """
     Pre-processing pass: find all DECODE(...) calls and convert to CASE.
     Returns (converted_sql, changed).
@@ -793,8 +800,9 @@ def _is_sql(content: str, source: str, start: int) -> bool:
     return False
 
 
-def find_sql_strings(source: str) -> list[StringLiteral]:
-    all_strings: list[StringLiteral] = []
+def find_sql_strings(source):
+    # type: (str) -> List[StringLiteral]
+    all_strings = []  # List[StringLiteral]
     for m in _JS_TOKEN_RE.finditer(source):
         dq = m.group('dqstr')
         sq = m.group('sqstr')
@@ -814,7 +822,7 @@ def find_sql_strings(source: str) -> list[StringLiteral]:
         return []
 
     # Group strings connected by '+' and propagate SQL detection
-    groups: list[list[int]] = []
+    groups = []  # List[List[int]]
     current_group = [0]
     for i in range(1, len(all_strings)):
         prev = all_strings[i - 1]
@@ -847,8 +855,8 @@ class FileConverter:
     # inside string literals.
     RAW_SQL_EXTENSIONS = {'.sql', '.hql', '.hive', '.ddl', '.dml'}
 
-    def convert_file(self, source: str,
-                     filepath: str = "<stdin>") -> tuple[str, ConversionReport]:
+    def convert_file(self, source, filepath="<stdin>"):
+        # type: (str, str) -> Tuple[str, ConversionReport]
         report = ConversionReport(file=filepath)
 
         # 1. Detect dialect label
@@ -913,7 +921,7 @@ class FileConverter:
         """
         # Split file into PROTECTED (scripting) and CONVERTIBLE (SQL) segments.
         # A segment is a tuple (text, protected:bool).
-        segments: list[tuple[str, bool]] = []
+        segments = []  # List[Tuple[str, bool]]
         pos = 0
         in_js_block = False
         js_block_start = -1
@@ -1070,8 +1078,9 @@ def process_file(input_path: str, output_path: Optional[str],
     return report
 
 
-def process_directory(input_dir: str, output_dir: str,
-                      recursive: bool, dry_run: bool) -> list[ConversionReport]:
+def process_directory(input_dir, output_dir,
+                      recursive, dry_run):
+    # type: (str, str, bool, bool) -> List[ConversionReport]
     reports = []
     extensions = ('*.js', '*.sql', '*.hql', '*.hive', '*.ddl', '*.dml')
     for ext in extensions:
