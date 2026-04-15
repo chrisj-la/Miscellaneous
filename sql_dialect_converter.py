@@ -1469,6 +1469,63 @@ _QUALIFIED_FUNC_RE = re.compile(
     r'\b([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*)\s*\(')
 
 
+def _strip_sql_comments(source):
+    # type: (str) -> str
+    """
+    Remove SQL comments from source while preserving line count
+    (so line numbers remain accurate for reporting).
+    Handles:
+      - Line comments: everything after '--' (that isn't inside a string)
+      - Block comments: /* ... */ including multi-line
+    """
+    result = []
+    in_block_comment = False
+    for line in source.split('\n'):
+        out = []
+        i = 0
+        in_string = None  # tracks ' or " when inside a string literal
+        while i < len(line):
+            ch = line[i]
+
+            if in_block_comment:
+                if ch == '*' and i + 1 < len(line) and line[i + 1] == '/':
+                    in_block_comment = False
+                    i += 2
+                    continue
+                i += 1
+                continue
+
+            if in_string:
+                out.append(ch)
+                if ch == in_string:
+                    in_string = None
+                elif ch == '\\':
+                    # skip escaped char
+                    i += 1
+                    if i < len(line):
+                        out.append(line[i])
+                i += 1
+                continue
+
+            # Not in comment, not in string
+            if ch in ("'", '"'):
+                in_string = ch
+                out.append(ch)
+                i += 1
+            elif ch == '-' and i + 1 < len(line) and line[i + 1] == '-':
+                # Line comment — skip rest of line
+                break
+            elif ch == '/' and i + 1 < len(line) and line[i + 1] == '*':
+                in_block_comment = True
+                i += 2
+            else:
+                out.append(ch)
+                i += 1
+
+        result.append(''.join(out))
+    return '\n'.join(result)
+
+
 def scan_for_udfs(source, filepath):
     # type: (str, str) -> List
     """
@@ -1481,29 +1538,33 @@ def scan_for_udfs(source, filepath):
     udfs = []
     seen = set()  # (func_name_upper, line_num) to deduplicate
 
-    # Split into lines, skip protected blocks
-    lines = source.split('\n')
+    # Strip SQL comments (preserves line numbers)
+    cleaned = _strip_sql_comments(source)
+
+    # Split both original (for directive detection) and cleaned (for scanning)
+    orig_lines = source.split('\n')
+    clean_lines = cleaned.split('\n')
     in_js_block = False
 
-    for line_num, line in enumerate(lines, 1):
-        stripped = line.strip().lower()
+    for line_num, (orig, line) in enumerate(zip(orig_lines, clean_lines), 1):
+        orig_stripped = orig.strip().lower()
 
-        # Skip --!javascript blocks entirely
-        if stripped.startswith('--!javascript'):
+        # Skip --!javascript blocks entirely (check original)
+        if orig_stripped.startswith('--!javascript'):
             in_js_block = True
             continue
-        if stripped.startswith('--!endjavascript'):
+        if orig_stripped.startswith('--!endjavascript'):
             in_js_block = False
             continue
         if in_js_block:
             continue
 
-        # Skip --!eval lines and other directives
-        if stripped.startswith('--!'):
+        # Skip --!eval lines and other directives (check original)
+        if orig_stripped.startswith('--!'):
             continue
 
-        # Skip SQL comments
-        if stripped.startswith('--'):
+        # Skip lines that are entirely empty after comment stripping
+        if not line.strip():
             continue
 
         # Find schema-qualified function calls (almost always UDFs)
