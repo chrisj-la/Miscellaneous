@@ -2,10 +2,10 @@
 """
 SQL Dialect Converter for Nashorn JavaScript and Raw SQL Files
 ===============================================================
-Reads a dialect label near the top of each file:
+Reads a dialect directive near the top of each file:
 
-    --!impala   →  converts Impala SQL to Trino,  relabels --!trino
-    --!hive     →  converts Hive  SQL to Presto,  relabels --!presto
+    --!impala   →  converts Impala SQL to Trino,  updates directive to --!trino
+    --!hive     →  converts Hive  SQL to Presto,  updates directive to --!presto
     --!null     →  no conversion, file is left untouched
 
 Supported file types:
@@ -16,11 +16,11 @@ All JavaScript / Nashorn scripting is preserved exactly as-is;
 only the SQL content is rewritten.
 
 Usage:
-    python sql_dialect_converter.py input.js  -o output.js
-    python sql_dialect_converter.py input.sql -o output.sql
-    python sql_dialect_converter.py input_dir/ -o output_dir/ --recursive
-    python sql_dialect_converter.py input.sql --dry-run
-    python sql_dialect_converter.py --self-test
+    python impala-hive_to_trino-presto.py input.js  -o output.js
+    python impala-hive_to_trino-presto.py input.sql -o output.sql
+    python impala-hive_to_trino-presto.py input_dir/ -o output_dir/ --recursive
+    python impala-hive_to_trino-presto.py input.sql --dry-run
+    python impala-hive_to_trino-presto.py --self-test
 """
 
 import re
@@ -42,7 +42,7 @@ log = logging.getLogger(__name__)
 class StringLiteral:
     """A JS string literal found in the source."""
     def __init__(self, start, end, quote, raw, unescaped,
-                 is_sql=False, converted=""):
+                 is_sql=False, converted=None):
         self.start = start
         self.end = end
         self.quote = quote
@@ -55,7 +55,8 @@ class StringLiteral:
 class ConversionReport:
     def __init__(self, file, dialect="", target="",
                  strings_found=0, strings_changed=0,
-                 rules_applied=None, skipped=False):
+                 rules_applied=None, skipped=False,
+                 flags=None, udfs=None):
         self.file = file
         self.dialect = dialect
         self.target = target
@@ -63,20 +64,21 @@ class ConversionReport:
         self.strings_changed = strings_changed
         self.rules_applied = rules_applied if rules_applied is not None else []
         self.skipped = skipped
+        self.flags = flags if flags is not None else []
+        self.udfs = udfs if udfs is not None else []  # List of (line_num, func_name)
 
 
 # ===========================================================================
 #  DIALECT DETECTION
 # ===========================================================================
 
-# Matches the label in JS line-comments:  // --!impala   or  // --!hive  etc.
-# Also matches inside string literals or standalone comment lines.
-_DIALECT_LABEL_RE = re.compile(
+# Matches the dialect directive in comments:  // --!impala   or  --!hive  etc.
+_DIALECT_DIRECTIVE_RE = re.compile(
     r'--!(impala|hive|null|trino|presto)\b',
     re.IGNORECASE
 )
 
-# Map source dialect → (target dialect, label to write)
+# Map source dialect → (target dialect, directive to write)
 DIALECT_MAP = {
     "impala": ("trino",  "--!trino"),
     "hive":   ("presto", "--!presto"),
@@ -85,13 +87,13 @@ DIALECT_MAP = {
 
 def detect_dialect(source, scan_lines=30):
     """
-    Scan the first *scan_lines* lines of source for a --!<dialect> label.
+    Scan the first *scan_lines* lines of source for a --!<dialect> directive.
     Returns the regex Match object (so we know position + dialect), or None.
     """
     # Only scan the head of the file
     lines = source.split('\n', scan_lines)
     head = '\n'.join(lines[:scan_lines])
-    return _DIALECT_LABEL_RE.search(head)
+    return _DIALECT_DIRECTIVE_RE.search(head)
 
 
 # ===========================================================================
@@ -128,7 +130,8 @@ _BODY = rf"(?:[^()']*|\({_L1}\)|{_Q})*"
 class SQLConverter:
     """Base class: applies an ordered list of regex rewrite rules."""
 
-    def __init__(self):
+    def __init__(self, annotate=False):
+        self.annotate = annotate
         self.rules = self._build_rules()
 
     def _build_rules(self):
@@ -358,17 +361,18 @@ class ImpalaToTrinoConverter(SQLConverter):
 
     def _build_rules(self):
         r = []
+        ann = self.annotate  # shorthand
 
         # ── Impala-only statements ─────────────────────────────────────
         _add(r, "Remove COMPUTE STATS",
              r"(?m)^\s*COMPUTE\s+(?:INCREMENTAL\s+)?STATS\s+[^;]*;?\s*$",
-             "/* REMOVED: COMPUTE STATS (not needed in Trino) */")
+             "/* REMOVED: COMPUTE STATS (not needed in Trino) */" if ann else "")
         _add(r, "Remove INVALIDATE METADATA",
              r"(?m)^\s*INVALIDATE\s+METADATA\s*[^;]*;?\s*$",
-             "/* REMOVED: INVALIDATE METADATA (not needed in Trino) */")
+             "/* REMOVED: INVALIDATE METADATA (not needed in Trino) */" if ann else "")
         _add(r, "Remove REFRESH",
              r"(?m)^\s*REFRESH\s+[^;]*;?\s*$",
-             "/* REMOVED: REFRESH (not needed in Trino) */")
+             "/* REMOVED: REFRESH (not needed in Trino) */" if ann else "")
 
         # ── Data types ─────────────────────────────────────────────────
         _add(r, "CAST(... AS STRING) → CAST(... AS VARCHAR)",
@@ -384,28 +388,36 @@ class ImpalaToTrinoConverter(SQLConverter):
              r"\bINT\b(?!EGER|ERVAL|O\b)", "INTEGER")
 
         # ── Storage / DDL clauses ──────────────────────────────────────
-        _add(r, "Remove STORED AS ...",
-             r"\bSTORED\s+AS\s+(?:PARQUET|PARQUETFILE|TEXTFILE|RCFILE|"
+        _add(r, "STORED AS fmt → WITH (format = 'fmt')",
+             r"\bSTORED\s+AS\s+(PARQUET|PARQUETFILE|TEXTFILE|RCFILE|"
              r"SEQUENCEFILE|AVRO|ORC|JSONFILE)\b",
-             "/* \\g<0> – adjust for Trino connector */")
+             lambda m: (
+                 ("/* Was: {} */ ".format(m.group(0)) if ann else "") +
+                 "WITH (format = '{}')".format(
+                     m.group(1).upper()
+                     .replace('PARQUETFILE', 'PARQUET')
+                     .replace('JSONFILE', 'JSON')
+                     .replace('SEQUENCEFILE', 'SEQUENCEFILE')
+                 )))
         _add(r, "Remove ROW FORMAT DELIMITED ...",
              r"\bROW\s+FORMAT\s+DELIMITED\s+FIELDS\s+TERMINATED\s+BY\s+'[^']*'"
              r"(?:\s+LINES\s+TERMINATED\s+BY\s+'[^']*')?",
-             "/* \\g<0> – adjust for Trino connector */")
+             "/* \\g<0> – adjust for Trino connector */" if ann else "")
         _add(r, "Remove LOCATION",
              r"\bLOCATION\s+'[^']*'",
-             "/* \\g<0> – adjust for Trino connector */")
+             "/* \\g<0> – adjust for Trino connector */" if ann else "")
         _add(r, "Remove TBLPROPERTIES",
              r"\bTBLPROPERTIES\s*\([^)]*\)",
-             "/* \\g<0> – adjust for Trino connector */")
+             "/* \\g<0> – adjust for Trino connector */" if ann else "")
         _add(r, "Remove SORT BY",
              r"\bSORT\s+BY\s*\([^)]*\)",
-             "/* \\g<0> – adjust for Trino connector */")
+             "/* \\g<0> – adjust for Trino connector */" if ann else "")
 
         # ── INSERT OVERWRITE ───────────────────────────────────────────
         _add(r, "INSERT OVERWRITE → INSERT INTO",
              r"\bINSERT\s+OVERWRITE\s+(?:TABLE\s+)?(\S+)",
-             r"/* Was INSERT OVERWRITE – truncate first in Trino */ INSERT INTO \1")
+             r"/* Was INSERT OVERWRITE – truncate first in Trino */ INSERT INTO \1"
+             if ann else r"INSERT INTO \1")
 
         # ── Functions ──────────────────────────────────────────────────
         _add(r, "NVL → COALESCE",
@@ -422,8 +434,8 @@ class ImpalaToTrinoConverter(SQLConverter):
                         f"'{m.group(2) if m.group(2) else ','}')")
 
         # Date / time
-        _add(r, "UNIX_TIMESTAMP() → TO_UNIXTIME(NOW())",
-             r"\bUNIX_TIMESTAMP\s*\(\s*\)", "TO_UNIXTIME(NOW())")
+        _add(r, "UNIX_TIMESTAMP() → TO_UNIXTIME(current_timestamp)",
+             r"\bUNIX_TIMESTAMP\s*\(\s*\)", "TO_UNIXTIME(current_timestamp)")
         _add(r, "UNIX_TIMESTAMP(expr) → TO_UNIXTIME(",
              r"\bUNIX_TIMESTAMP\s*\(", "TO_UNIXTIME(")
         _add(r, "FROM_TIMESTAMP → DATE_FORMAT",
@@ -449,8 +461,10 @@ class ImpalaToTrinoConverter(SQLConverter):
         _add(r, "TRUNC(d, fmt) → DATE_TRUNC(fmt, d)",
              r"\bTRUNC\s*\(\s*(" + _ARG + r")\s*,\s*'([^']+)'\s*\)",
              lambda m: f"DATE_TRUNC('{m.group(2).strip().lower()}', {m.group(1).strip()})")
-        _add(r, "CURRENT_TIMESTAMP() → NOW()",
-             r"\bCURRENT_TIMESTAMP\s*\(\s*\)", "NOW()")
+        _add(r, "CURRENT_TIMESTAMP() → current_timestamp",
+             r"\bCURRENT_TIMESTAMP\s*\(\s*\)", "current_timestamp")
+        _add(r, "NOW() → current_timestamp",
+             r"\bNOW\s*\(\s*\)", "current_timestamp")
 
         # String
         _add(r, "STRLEFT(s,n) → SUBSTR(s,1,n)",
@@ -461,8 +475,21 @@ class ImpalaToTrinoConverter(SQLConverter):
              lambda m: f"SUBSTR({m.group(1).strip()}, -{m.group(2).strip()})")
         _add(r, "INSTR → STRPOS",
              r"\bINSTR\s*\(", "STRPOS(")
+        _add(r, "LCASE → lower",
+             r"\bLCASE\s*\(", "lower(")
+        _add(r, "UCASE → upper",
+             r"\bUCASE\s*\(", "upper(")
+        _add(r, "levenshtein → levenshtein_distance",
+             r"\bLEVENSHTEIN\s*\(", "levenshtein_distance(")
+        _add(r, "BASE64ENCODE → to_base64",
+             r"\bBASE64ENCODE\s*\(", "to_base64(")
+        _add(r, "BASE64DECODE → from_base64",
+             r"\bBASE64DECODE\s*\(", "from_base64(")
+        _add(r, "FIND_IN_SET → flag no equivalent",
+             r"\bFIND_IN_SET\s*\(",
+             "/* TODO: FIND_IN_SET has no direct Trino equivalent – rewrite with STRPOS or ARRAY */ FIND_IN_SET(")
 
-        # Math
+        # Math / hash
         _add(r, "FNV_HASH → XXHASH64",
              r"\bFNV_HASH\s*\(", "XXHASH64(")
         _add(r, "PMOD(a,b) → ((a%b)+b)%b",
@@ -481,10 +508,19 @@ class ImpalaToTrinoConverter(SQLConverter):
         _add(r, "GROUP_CONCAT in window → ARRAY_JOIN(ARRAY_AGG(...) OVER ...)",
              r"placeholder_gc_window_xyzzy", "")  # handled by GROUP_CONCAT rule above
 
-        # ── REGEXP operator ────────────────────────────────────────────
+        # ── REGEXP / RLIKE / ILIKE / IREGEXP operators ─────────────────
         _add(r, "col REGEXP 'pat' → REGEXP_LIKE(col, 'pat')",
              r"\b(\S+)\s+REGEXP\s+'([^']+)'",
              lambda m: f"REGEXP_LIKE({m.group(1).strip()}, '{m.group(2)}')")
+        _add(r, "col RLIKE 'pat' → REGEXP_LIKE(col, 'pat')",
+             r"\b(\S+)\s+RLIKE\s+'([^']+)'",
+             lambda m: f"REGEXP_LIKE({m.group(1).strip()}, '{m.group(2)}')")
+        _add(r, "col ILIKE 'pat' → lower(col) LIKE lower('pat')",
+             r"\b(\S+)\s+ILIKE\s+'([^']+)'",
+             lambda m: f"lower({m.group(1).strip()}) LIKE lower('{m.group(2)}')")
+        _add(r, "col IREGEXP 'pat' → regexp_like(col, '(?i)pat')",
+             r"\b(\S+)\s+IREGEXP\s+'([^']+)'",
+             lambda m: f"regexp_like({m.group(1).strip()}, '(?i){m.group(2)}')")
 
         # ── Null-handling functions ────────────────────────────────────
         _add(r, "NULLIFZERO(x) → NULLIF(x, 0)",
@@ -529,6 +565,28 @@ class ImpalaToTrinoConverter(SQLConverter):
              lambda m: (f"{m.group(1)}({m.group(2).strip()}, "
                         f"'{_convert_java_to_mysql_format(m.group(3))}')"))
 
+        # ── System / session functions ──────────────────────────────────
+        # Trino uses bare keywords (no parens) for these
+        _add(r, "effective_user() → current_user",
+             r"\bEFFECTIVE_USER\s*\(\s*\)", "current_user")
+        _add(r, "logged_in_user() → current_user",
+             r"\bLOGGED_IN_USER\s*\(\s*\)", "current_user")
+        # USER() as a function call (not as a keyword in other contexts)
+        _add(r, "USER() → current_user",
+             r"\bUSER\s*\(\s*\)", "current_user")
+        _add(r, "current_database() → current_schema",
+             r"\bCURRENT_DATABASE\s*\(\s*\)", "current_schema")
+        # Impala-only functions with no Trino equivalent
+        _add(r, "pid() → flag no equivalent",
+             r"\bPID\s*\(\s*\)",
+             "/* TODO: pid() has no Trino equivalent – remove or replace */ pid()")
+        _add(r, "coordinator() → flag no equivalent",
+             r"\bCOORDINATOR\s*\(\s*\)",
+             "/* TODO: coordinator() has no Trino equivalent – remove or replace */ coordinator()")
+        _add(r, "sleep(n) → flag no equivalent",
+             r"\bSLEEP\s*\(",
+             "/* TODO: sleep() has no Trino equivalent – remove or replace */ sleep(")
+
         # Identifiers / hints / misc
         _add(r, "Backtick identifiers → double-quotes",
              r"`([^`]+)`", r'"\1"')
@@ -558,14 +616,15 @@ class HiveToPrestoConverter(SQLConverter):
 
     def _build_rules(self):
         r = []
+        ann = self.annotate  # shorthand
 
         # ── Hive-only statements ───────────────────────────────────────
         _add(r, "Remove MSCK REPAIR TABLE",
              r"(?m)^\s*MSCK\s+REPAIR\s+TABLE\s+[^;]*;?\s*$",
-             "/* REMOVED: MSCK REPAIR TABLE (not needed in Presto) */")
+             "/* REMOVED: MSCK REPAIR TABLE (not needed in Presto) */" if ann else "")
         _add(r, "Remove ANALYZE TABLE",
              r"(?m)^\s*ANALYZE\s+TABLE\s+[^;]*;?\s*$",
-             "/* REMOVED: ANALYZE TABLE (not needed in Presto) */")
+             "/* REMOVED: ANALYZE TABLE (not needed in Presto) */" if ann else "")
 
         # ── Data types ─────────────────────────────────────────────────
         _add(r, "CAST(... AS STRING) → CAST(... AS VARCHAR)",
@@ -583,38 +642,46 @@ class HiveToPrestoConverter(SQLConverter):
              r"\bBINARY\b", "VARBINARY")
 
         # ── Storage / DDL clauses ──────────────────────────────────────
-        _add(r, "Remove STORED AS ...",
-             r"\bSTORED\s+AS\s+(?:PARQUET|PARQUETFILE|TEXTFILE|RCFILE|"
+        _add(r, "STORED AS fmt → WITH (format = 'fmt')",
+             r"\bSTORED\s+AS\s+(PARQUET|PARQUETFILE|TEXTFILE|RCFILE|"
              r"SEQUENCEFILE|AVRO|ORC|JSONFILE)\b",
-             "/* \\g<0> – adjust for Presto connector */")
+             lambda m: (
+                 ("/* Was: {} */ ".format(m.group(0)) if ann else "") +
+                 "WITH (format = '{}')".format(
+                     m.group(1).upper()
+                     .replace('PARQUETFILE', 'PARQUET')
+                     .replace('JSONFILE', 'JSON')
+                     .replace('SEQUENCEFILE', 'SEQUENCEFILE')
+                 )))
         _add(r, "Remove ROW FORMAT DELIMITED ...",
              r"\bROW\s+FORMAT\s+DELIMITED\s+FIELDS\s+TERMINATED\s+BY\s+'[^']*'"
              r"(?:\s+LINES\s+TERMINATED\s+BY\s+'[^']*')?",
-             "/* \\g<0> – adjust for Presto connector */")
+             "/* \\g<0> – adjust for Presto connector */" if ann else "")
         _add(r, "Remove ROW FORMAT SERDE ...",
              r"\bROW\s+FORMAT\s+SERDE\s+'[^']*'(?:\s+WITH\s+SERDEPROPERTIES\s*\([^)]*\))?",
-             "/* \\g<0> – adjust for Presto connector */")
+             "/* \\g<0> – adjust for Presto connector */" if ann else "")
         _add(r, "Remove LOCATION",
              r"\bLOCATION\s+'[^']*'",
-             "/* \\g<0> – adjust for Presto connector */")
+             "/* \\g<0> – adjust for Presto connector */" if ann else "")
         _add(r, "Remove TBLPROPERTIES",
              r"\bTBLPROPERTIES\s*\([^)]*\)",
-             "/* \\g<0> – adjust for Presto connector */")
+             "/* \\g<0> – adjust for Presto connector */" if ann else "")
         _add(r, "Remove CLUSTERED BY ... INTO n BUCKETS",
              r"\bCLUSTERED\s+BY\s*\([^)]*\)\s*(?:SORTED\s+BY\s*\([^)]*\)\s*)?"
              r"INTO\s+\d+\s+BUCKETS",
-             "/* \\g<0> – adjust for Presto connector */")
+             "/* \\g<0> – adjust for Presto connector */" if ann else "")
         _add(r, "Remove SORT BY",
              r"\bSORT\s+BY\s*\([^)]*\)",
-             "/* \\g<0> – adjust for Presto connector */")
+             "/* \\g<0> – adjust for Presto connector */" if ann else "")
         _add(r, "Remove DISTRIBUTE BY",
              r"\bDISTRIBUTE\s+BY\b[^;)]*",
-             "/* \\g<0> – adjust for Presto connector */")
+             "/* \\g<0> – adjust for Presto connector */" if ann else "")
 
         # ── INSERT OVERWRITE ───────────────────────────────────────────
         _add(r, "INSERT OVERWRITE → INSERT INTO",
              r"\bINSERT\s+OVERWRITE\s+(?:TABLE\s+)?(\S+)",
-             r"/* Was INSERT OVERWRITE – truncate first in Presto */ INSERT INTO \1")
+             r"/* Was INSERT OVERWRITE – truncate first in Presto */ INSERT INTO \1"
+             if ann else r"INSERT INTO \1")
 
         # ── Functions ──────────────────────────────────────────────────
         _add(r, "NVL → COALESCE",
@@ -640,6 +707,36 @@ class HiveToPrestoConverter(SQLConverter):
         _add(r, "LOCATE(needle,hay) → STRPOS(hay,needle)",
              r"\bLOCATE\s*\(\s*(" + _ARG + r")\s*,\s*(" + _ARG + r")\s*\)",
              lambda m: f"STRPOS({m.group(2).strip()}, {m.group(1).strip()})")
+        _add(r, "LCASE → lower",
+             r"\bLCASE\s*\(", "lower(")
+        _add(r, "UCASE → upper",
+             r"\bUCASE\s*\(", "upper(")
+        _add(r, "levenshtein → levenshtein_distance",
+             r"\bLEVENSHTEIN\s*\(", "levenshtein_distance(")
+        _add(r, "FIND_IN_SET → flag no equivalent",
+             r"\bFIND_IN_SET\s*\(",
+             "/* TODO: FIND_IN_SET has no direct Presto equivalent – rewrite with STRPOS or ARRAY */ FIND_IN_SET(")
+
+        # JSON
+        _add(r, "GET_JSON_OBJECT → json_extract_scalar",
+             r"\bGET_JSON_OBJECT\s*\(", "json_extract_scalar(")
+
+        # Hash
+        _add(r, "SHA(s) → sha1(s)",
+             r"\bSHA\s*\(\s*(" + _BODY + r")\s*\)",
+             lambda m: f"sha1({m.group(1).strip()})")
+        _add(r, "SHA2(s, 256) → sha256(s) / SHA2(s, 512) → sha512(s)",
+             r"\bSHA2\s*\(\s*(" + _ARG + r")\s*,\s*(\d+)\s*\)",
+             lambda m: ("sha256({})".format(m.group(1).strip()) if m.group(2).strip() == '256'
+                        else "sha512({})".format(m.group(1).strip()) if m.group(2).strip() == '512'
+                        else "/* TODO: SHA2 with length {} not supported */ SHA2({}, {})".format(
+                            m.group(2).strip(), m.group(1).strip(), m.group(2).strip())))
+
+        # Encoding
+        _add(r, "BASE64 → to_base64",
+             r"\bBASE64\s*\(", "to_base64(")
+        _add(r, "UNBASE64 → from_base64",
+             r"\bUNBASE64\s*\(", "from_base64(")
 
         # Regex
         _add(r, "RLIKE → REGEXP_LIKE",
@@ -647,8 +744,8 @@ class HiveToPrestoConverter(SQLConverter):
              lambda m: f"REGEXP_LIKE({m.group(1).strip()}, '{m.group(2)}')")
 
         # Date / time
-        _add(r, "UNIX_TIMESTAMP() → TO_UNIXTIME(NOW())",
-             r"\bUNIX_TIMESTAMP\s*\(\s*\)", "TO_UNIXTIME(NOW())")
+        _add(r, "UNIX_TIMESTAMP() → TO_UNIXTIME(current_timestamp)",
+             r"\bUNIX_TIMESTAMP\s*\(\s*\)", "TO_UNIXTIME(current_timestamp)")
         _add(r, "UNIX_TIMESTAMP(expr) → TO_UNIXTIME(",
              r"\bUNIX_TIMESTAMP\s*\(", "TO_UNIXTIME(")
         _add(r, "TO_DATE(expr) → CAST(expr AS DATE)",
@@ -672,8 +769,10 @@ class HiveToPrestoConverter(SQLConverter):
         _add(r, "TRUNC(d, fmt) → DATE_TRUNC(fmt, d)",
              r"\bTRUNC\s*\(\s*(" + _ARG + r")\s*,\s*'([^']+)'\s*\)",
              lambda m: f"DATE_TRUNC('{m.group(2).strip().lower()}', {m.group(1).strip()})")
-        _add(r, "CURRENT_TIMESTAMP() → NOW()",
-             r"\bCURRENT_TIMESTAMP\s*\(\s*\)", "NOW()")
+        _add(r, "CURRENT_TIMESTAMP() → current_timestamp",
+             r"\bCURRENT_TIMESTAMP\s*\(\s*\)", "current_timestamp")
+        _add(r, "NOW() → current_timestamp",
+             r"\bNOW\s*\(\s*\)", "current_timestamp")
 
         # Aggregate / analytic
         _add(r, "PERCENTILE_APPROX → APPROX_PERCENTILE",
@@ -716,6 +815,13 @@ class HiveToPrestoConverter(SQLConverter):
              r"\b(DATE_FORMAT|DATE_PARSE)\s*\(\s*(" + _ARG + r")\s*,\s*'([^']+)'\s*\)",
              lambda m: (f"{m.group(1)}({m.group(2).strip()}, "
                         f"'{_convert_java_to_mysql_format(m.group(3))}')"))
+
+        # ── System / session functions ──────────────────────────────────
+        # Presto uses bare keywords (no parens) for these
+        _add(r, "logged_in_user() → current_user",
+             r"\bLOGGED_IN_USER\s*\(\s*\)", "current_user")
+        _add(r, "current_database() → current_schema",
+             r"\bCURRENT_DATABASE\s*\(\s*\)", "current_schema")
 
         # Identifiers / misc
         _add(r, "Backtick identifiers → double-quotes",
@@ -855,29 +961,32 @@ class FileConverter:
     # inside string literals.
     RAW_SQL_EXTENSIONS = {'.sql', '.hql', '.hive', '.ddl', '.dml'}
 
+    def __init__(self, annotate=False):
+        self.annotate = annotate
+
     def convert_file(self, source, filepath="<stdin>"):
         # type: (str, str) -> Tuple[str, ConversionReport]
         report = ConversionReport(file=filepath)
 
-        # 1. Detect dialect label
-        label_match = detect_dialect(source)
-        if not label_match:
-            log.warning(f"{filepath}: no --!<dialect> label found – skipping")
+        # 1. Detect dialect directive
+        directive_match = detect_dialect(source)
+        if not directive_match:
+            log.warning(f"{filepath}: no --!<dialect> directive found – skipping")
             report.skipped = True
             report.dialect = "unknown"
             return source, report
 
-        dialect = label_match.group(1).lower()
+        dialect = directive_match.group(1).lower()
         report.dialect = dialect
 
         # 2. Check if conversion is needed
         if dialect == "null":
-            log.info(f"{filepath}: --!null label – skipping (no conversion)")
+            log.info(f"{filepath}: --!null directive – skipping (no conversion)")
             report.skipped = True
             return source, report
 
         if dialect in ("trino", "presto"):
-            log.info(f"{filepath}: already labelled --!{dialect} – skipping")
+            log.info(f"{filepath}: already marked --!{dialect} – skipping")
             report.skipped = True
             return source, report
 
@@ -886,12 +995,12 @@ class FileConverter:
             report.skipped = True
             return source, report
 
-        target, new_label = DIALECT_MAP[dialect]
+        target, new_directive = DIALECT_MAP[dialect]
         report.target = target
 
         # 3. Build the appropriate converter
         converter_cls = _CONVERTERS[dialect]
-        converter = converter_cls()
+        converter = converter_cls(annotate=self.annotate)
 
         # 4. Choose conversion strategy based on file type
         ext = Path(filepath).suffix.lower()
@@ -900,9 +1009,9 @@ class FileConverter:
         else:
             result = self._convert_embedded_sql(source, converter, report)
 
-        # 5. Replace the dialect label
-        old_label = label_match.group(0)   # e.g. "--!impala"
-        result = result.replace(old_label, new_label, 1)
+        # 5. Replace the dialect directive
+        old_directive = directive_match.group(0)   # e.g. "--!impala"
+        result = result.replace(old_directive, new_directive, 1)
 
         return result, report
 
@@ -1030,7 +1139,7 @@ class FileConverter:
         # Rebuild – replace in reverse offset order so positions stay valid
         result = source
         for lit in sorted(sql_strings, key=lambda l: l.start, reverse=True):
-            if not lit.converted or lit.converted == lit.unescaped:
+            if lit.converted is None or lit.converted == lit.unescaped:
                 continue
             escaped = _escape_js(lit.converted, lit.quote)
             replacement = f'{lit.quote}{escaped}{lit.quote}'
@@ -1040,16 +1149,412 @@ class FileConverter:
 
 
 # ===========================================================================
+#  FLAG SCANNER — finds items needing manual review in converted output
+# ===========================================================================
+
+# Patterns to scan for in converted output, with category tags.
+# Each tuple is (compiled_regex, category_string).
+_FLAG_PATTERNS = [
+    (re.compile(r'/\*\s*TODO:\s*(.+?)\*/', re.IGNORECASE),
+     "TODO"),
+    (re.compile(r'/\*\s*REMOVED:\s*(.+?)\*/', re.IGNORECASE),
+     "REMOVED"),
+    (re.compile(r'/\*\s*Was INSERT OVERWRITE\b(.+?)\*/', re.IGNORECASE),
+     "INSERT OVERWRITE"),
+    (re.compile(r'/\*.*?adjust for (Trino|Presto) connector.*?\*/', re.IGNORECASE),
+     "DDL ADJUSTMENT"),
+]
+
+
+def scan_for_flags(converted_text, filepath):
+    # type: (str, str) -> List
+    """
+    Scan converted output for markers that need manual review.
+    Returns a list of (line_number, category, message) tuples.
+    """
+    flags = []
+    for line_num, line in enumerate(converted_text.split('\n'), 1):
+        for pattern, category in _FLAG_PATTERNS:
+            for m in pattern.finditer(line):
+                # Extract the comment text, cleaned up
+                comment = m.group(0).strip()
+                # Trim leading /* and trailing */
+                inner = comment
+                if inner.startswith('/*'):
+                    inner = inner[2:]
+                if inner.endswith('*/'):
+                    inner = inner[:-2]
+                inner = inner.strip()
+                flags.append((line_num, category, inner))
+    return flags
+
+
+def generate_review_report(reports, report_path):
+    # type: (List[ConversionReport], str) -> None
+    """
+    Write a review report listing all files with items that need
+    manual attention (TODOs, removed statements, DDL adjustments)
+    and any detected user-defined functions.
+    """
+    flagged_reports = [r for r in reports if r.flags]
+    udf_reports = [r for r in reports if r.udfs]
+
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write("=" * 78 + "\n")
+        f.write("  SQL DIALECT CONVERSION — REVIEW REPORT\n")
+        f.write("=" * 78 + "\n\n")
+
+        # Summary
+        total = len(reports)
+        skipped = sum(1 for r in reports if r.skipped)
+        converted = total - skipped
+        flagged = len(flagged_reports)
+        total_flags = sum(len(r.flags) for r in flagged_reports)
+
+        # UDF summary
+        all_udf_names = set()
+        total_udf_calls = 0
+        for r in udf_reports:
+            for _, name in r.udfs:
+                all_udf_names.add(name.upper())
+                total_udf_calls += 1
+        udf_count = len(all_udf_names)
+
+        f.write(f"Files processed:        {total}\n")
+        f.write(f"Files converted:        {converted}\n")
+        f.write(f"Files skipped:          {skipped}\n")
+        f.write(f"Files with flags:       {flagged}\n")
+        f.write(f"Total flags:            {total_flags}\n")
+        f.write(f"Files with UDFs:        {len(udf_reports)}\n")
+        f.write(f"Unique UDFs detected:   {udf_count}\n")
+        f.write(f"Total UDF references:   {total_udf_calls}\n")
+
+        # ── Flag details ───────────────────────────────────────────
+        if flagged_reports:
+            # Summary by category
+            category_counts = {}
+            for r in flagged_reports:
+                for _, category, _ in r.flags:
+                    category_counts[category] = category_counts.get(category, 0) + 1
+
+            f.write("\nFlags by category:\n")
+            for category in sorted(category_counts.keys()):
+                f.write(f"  {category}: {category_counts[category]}\n")
+
+            # Per-file detail
+            f.write("\n" + "-" * 78 + "\n")
+            f.write("  DETAILED FLAGS BY FILE\n")
+            f.write("-" * 78 + "\n")
+
+            for r in flagged_reports:
+                f.write(f"\n{r.file}")
+                if r.dialect and r.target:
+                    f.write(f"  [--!{r.dialect} → --!{r.target}]")
+                f.write("\n")
+
+                for line_num, category, message in r.flags:
+                    f.write(f"  Line {line_num:>5}  [{category}]  {message}\n")
+        else:
+            f.write("\nNo conversion flags require manual review.\n")
+
+        # ── UDF details ────────────────────────────────────────────
+        f.write("\n" + "-" * 78 + "\n")
+        f.write("  USER-DEFINED FUNCTIONS DETECTED\n")
+        f.write("-" * 78 + "\n")
+
+        if not udf_reports:
+            f.write("\nNo user-defined functions detected.\n")
+        else:
+            # Cross-file UDF summary: each unique UDF with all locations
+            udf_index = {}  # name_upper -> [(file, line_num, original_name)]
+            for r in udf_reports:
+                for line_num, name in r.udfs:
+                    upper = name.upper()
+                    if upper not in udf_index:
+                        udf_index[upper] = []
+                    udf_index[upper].append((r.file, line_num, name))
+
+            f.write(f"\n{udf_count} unique function(s) not recognized as "
+                    f"built-in, found in {len(udf_reports)} file(s).\n")
+            f.write("These may be user-defined functions that require "
+                    "manual porting to Trino/Presto.\n")
+
+            for udf_name in sorted(udf_index.keys()):
+                locations = udf_index[udf_name]
+                original = locations[0][2]  # preserve original casing
+                f.write(f"\n  {original}()  "
+                        f"({len(locations)} occurrence(s))\n")
+                for fpath, line_num, _ in locations:
+                    f.write(f"    {fpath}  line {line_num}\n")
+
+        f.write("\n" + "=" * 78 + "\n")
+
+    log.info(f"Review report written to {report_path}"
+             f" ({flagged} flagged file(s), {total_flags} flag(s), "
+             f"{udf_count} UDF(s) detected)")
+
+
+# ===========================================================================
+#  UDF DETECTOR — identifies likely user-defined functions
+# ===========================================================================
+
+# SQL keywords and clauses that look like function calls but aren't.
+_SQL_KEYWORDS = frozenset(k.upper() for k in [
+    'select', 'from', 'where', 'and', 'or', 'not', 'in', 'on', 'as',
+    'case', 'when', 'then', 'else', 'end', 'is', 'null', 'between',
+    'like', 'exists', 'having', 'group', 'order', 'by', 'asc', 'desc',
+    'limit', 'offset', 'union', 'all', 'distinct', 'into', 'values',
+    'set', 'join', 'left', 'right', 'inner', 'outer', 'cross', 'full',
+    'insert', 'update', 'delete', 'create', 'drop', 'alter', 'table',
+    'view', 'index', 'database', 'schema', 'if', 'over', 'partition',
+    'rows', 'range', 'unbounded', 'preceding', 'following', 'current',
+    'row', 'with', 'recursive', 'temporary', 'temp', 'external',
+    'interval', 'true', 'false', 'primary', 'key', 'foreign',
+    'references', 'constraint', 'default', 'check', 'unique',
+    'grant', 'revoke', 'to', 'role', 'use', 'show', 'describe',
+    'explain', 'analyze', 'truncate', 'merge', 'using', 'matched',
+    'filter', 'within', 'array', 'map', 'struct', 'lateral',
+])
+
+# Known built-in function names across Impala, Hive, Trino, and Presto.
+# Any function call NOT in this set is flagged as a potential UDF.
+_KNOWN_BUILTINS = frozenset(k.upper() for k in [
+    # ── Aggregate ──────────────────────────────────────────────────
+    'avg', 'count', 'max', 'min', 'sum',
+    'group_concat', 'array_agg', 'array_join',
+    'collect_list', 'collect_set', 'set_agg',
+    'ndv', 'approx_distinct', 'approx_count_distinct',
+    'appx_median', 'approx_percentile', 'percentile_approx',
+    'percentile', 'percentile_cont', 'percentile_disc',
+    'stddev', 'stddev_pop', 'stddev_samp',
+    'variance', 'variance_pop', 'variance_samp', 'var_pop', 'var_samp',
+    'corr', 'covar_pop', 'covar_samp',
+    'regr_avgx', 'regr_avgy', 'regr_count', 'regr_intercept',
+    'regr_r2', 'regr_slope', 'regr_sxx', 'regr_sxy', 'regr_syy',
+    'histogram', 'numeric_histogram',
+    'bool_and', 'bool_or', 'every', 'any_value',
+    'count_if', 'sum_distinct', 'count_distinct',
+    'listagg', 'string_agg',
+    'bit_and', 'bit_or', 'bit_xor',
+    'checksum', 'arbitrary',
+    'max_by', 'min_by',
+    'map_agg', 'map_union', 'multimap_agg',
+    'reduce_agg', 'merge',
+    # ── Analytic / window ──────────────────────────────────────────
+    'row_number', 'rank', 'dense_rank', 'percent_rank', 'cume_dist',
+    'ntile', 'lag', 'lead',
+    'first_value', 'last_value', 'nth_value',
+    # ── Math ───────────────────────────────────────────────────────
+    'abs', 'ceil', 'ceiling', 'floor', 'round', 'truncate', 'trunc',
+    'mod', 'pmod', 'power', 'pow', 'sqrt', 'cbrt', 'exp',
+    'ln', 'log', 'log2', 'log10',
+    'sign', 'positive', 'negative',
+    'sin', 'cos', 'tan', 'asin', 'acos', 'atan', 'atan2',
+    'sinh', 'cosh', 'tanh',
+    'degrees', 'radians', 'pi', 'e',
+    'rand', 'random',
+    'greatest', 'least',
+    'width_bucket',
+    'fnv_hash', 'xxhash64', 'murmur_hash', 'md5', 'sha1', 'sha2',
+    'sha256', 'sha512', 'crc32',
+    'bin', 'hex', 'unhex',
+    'conv', 'shiftleft', 'shiftright', 'shiftrightunsigned',
+    'bitand', 'bitor', 'bitxor', 'bitnot',
+    'factorial', 'is_nan', 'is_inf',
+    'infinity', 'nan', 'from_base', 'to_base',
+    'bit_count', 'cosine_similarity',
+    # ── String ─────────────────────────────────────────────────────
+    'ascii', 'chr', 'char', 'char_length', 'character_length',
+    'length', 'octet_length', 'bit_length',
+    'concat', 'concat_ws',
+    'lower', 'lcase', 'upper', 'ucase', 'initcap',
+    'lpad', 'rpad', 'ltrim', 'rtrim', 'trim', 'btrim',
+    'substr', 'substring', 'strleft', 'strright',
+    'left', 'right', 'mid',
+    'instr', 'strpos', 'locate', 'position', 'charindex',
+    'find_in_set',
+    'replace', 'translate', 'overlay',
+    'repeat', 'reverse', 'space',
+    'split', 'split_part', 'split_to_map', 'split_to_multimap',
+    'starts_with', 'ends_with',
+    'regexp_extract', 'regexp_replace', 'regexp_like',
+    'regexp_count', 'regexp_split', 'regexp_extract_all',
+    'format', 'printf', 'format_number',
+    'soundex', 'levenshtein', 'levenshtein_distance', 'hamming_distance',
+    'base64', 'unbase64', 'to_utf8', 'from_utf8',
+    'encode', 'decode',
+    'url_encode', 'url_decode', 'url_extract_host',
+    'url_extract_path', 'url_extract_port', 'url_extract_protocol',
+    'url_extract_query', 'url_extract_parameter', 'url_extract_fragment',
+    'json_extract', 'json_extract_scalar', 'get_json_object',
+    'json_format', 'json_parse', 'json_array_get',
+    'json_array_length', 'json_size',
+    'parse_url', 'word_stem', 'normalize',
+    'codepoint', 'luhn_check',
+    # ── Date / time ────────────────────────────────────────────────
+    'now', 'current_timestamp', 'current_date', 'current_time',
+    'localtimestamp', 'localtime',
+    'date', 'time', 'timestamp',
+    'year', 'quarter', 'month', 'week', 'week_of_year', 'yearweek',
+    'day', 'dayofmonth', 'dayofweek', 'dayofyear', 'dayname', 'monthname',
+    'day_of_month', 'day_of_week', 'day_of_year',
+    'hour', 'minute', 'second', 'millisecond',
+    'date_format', 'date_parse', 'format_datetime', 'parse_datetime',
+    'from_timestamp', 'to_timestamp',
+    'date_add', 'date_sub', 'date_diff', 'datediff',
+    'date_trunc', 'date_part', 'extract',
+    'add_months', 'months_between', 'last_day', 'next_day',
+    'unix_timestamp', 'to_unixtime', 'from_unixtime',
+    'from_utc_timestamp', 'to_utc_timestamp',
+    'to_date',
+    'from_iso8601_date', 'from_iso8601_timestamp',
+    'to_iso8601', 'to_milliseconds',
+    'at_timezone', 'with_timezone',
+    'human_readable_seconds',
+    'sequence',
+    # ── Type conversion / conditional ──────────────────────────────
+    'cast', 'try_cast', 'typeof', 'coalesce',
+    'if', 'iff', 'ifnull', 'isnull', 'nullif', 'nullifzero', 'zeroifnull',
+    'nvl', 'nvl2', 'decode',
+    'try', 'try_cast',
+    # ── Collection / complex type ──────────────────────────────────
+    'size', 'cardinality',
+    'array', 'array_contains', 'contains',
+    'array_sort', 'sort_array', 'array_distinct', 'array_union',
+    'array_except', 'array_intersect', 'array_join',
+    'array_max', 'array_min', 'array_position', 'array_remove',
+    'element_at', 'slice', 'flatten', 'zip', 'zip_with',
+    'transform', 'filter', 'reduce', 'any_match', 'all_match',
+    'map', 'map_keys', 'map_values', 'map_entries',
+    'map_from_entries', 'map_filter', 'transform_keys', 'transform_values',
+    'map_concat', 'map_zip_with',
+    'named_struct', 'struct',
+    'explode', 'posexplode', 'inline',
+    'unnest',
+    # ── System / session / misc ────────────────────────────────────
+    'user', 'current_user', 'session_user', 'system_user',
+    'effective_user', 'logged_in_user',
+    'current_database', 'current_schema', 'current_catalog',
+    'current_groups', 'current_role', 'current_path',
+    'current_timezone',
+    'version', 'pid', 'coordinator', 'sleep',
+    'uuid',
+    'reflect', 'java_method',
+    'assert_true',
+    'raise_error',
+    'typeof',
+    'input_file_name', 'input_file_block_start', 'input_file_block_length',
+    # ── Trino/Presto-specific that might appear in converted output ─
+    'approx_distinct', 'approx_set', 'approx_most_frequent',
+    'tdigest_agg', 'value_at_quantile',
+    'qdigest_agg',
+    'from_base64', 'to_base64', 'from_hex', 'to_hex',
+    'hmac_md5', 'hmac_sha1', 'hmac_sha256', 'hmac_sha512',
+    'spooky_hash_v2_32', 'spooky_hash_v2_64',
+    'render', 'bar', 'color',
+    'ip_prefix', 'ip_subnet_min', 'ip_subnet_max', 'ip_subnet_range',
+    'is_subnet_of', 'is_private_ip',
+    'features',
+    'classification_miss_rate', 'classification_fall_out',
+    'classification_precision', 'classification_recall',
+    'classification_thresholds',
+    'wilson_interval_lower', 'wilson_interval_upper',
+])
+
+# Regex to find function-call patterns: word followed by '('
+_FUNC_CALL_RE = re.compile(r'\b([A-Za-z_][A-Za-z0-9_]*)\s*\(')
+
+# Patterns for schema-qualified function calls: schema.func(
+_QUALIFIED_FUNC_RE = re.compile(
+    r'\b([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*)\s*\(')
+
+
+def scan_for_udfs(source, filepath):
+    # type: (str, str) -> List
+    """
+    Scan SQL source for function calls that are not known built-ins.
+    Returns a list of (line_number, function_name) tuples.
+
+    Works on the ORIGINAL source (before conversion) so it captures
+    the functions as they were written, not after rewriting.
+    """
+    udfs = []
+    seen = set()  # (func_name_upper, line_num) to deduplicate
+
+    # Split into lines, skip protected blocks
+    lines = source.split('\n')
+    in_js_block = False
+
+    for line_num, line in enumerate(lines, 1):
+        stripped = line.strip().lower()
+
+        # Skip --!javascript blocks entirely
+        if stripped.startswith('--!javascript'):
+            in_js_block = True
+            continue
+        if stripped.startswith('--!endjavascript'):
+            in_js_block = False
+            continue
+        if in_js_block:
+            continue
+
+        # Skip --!eval lines and other directives
+        if stripped.startswith('--!'):
+            continue
+
+        # Skip SQL comments
+        if stripped.startswith('--'):
+            continue
+
+        # Find schema-qualified function calls (almost always UDFs)
+        for m in _QUALIFIED_FUNC_RE.finditer(line):
+            func_name = m.group(1)
+            key = (func_name.upper(), line_num)
+            if key not in seen:
+                seen.add(key)
+                udfs.append((line_num, func_name))
+
+        # Find unqualified function calls
+        for m in _FUNC_CALL_RE.finditer(line):
+            func_name = m.group(1)
+            upper = func_name.upper()
+
+            # Skip if it's a known built-in or SQL keyword
+            if upper in _KNOWN_BUILTINS or upper in _SQL_KEYWORDS:
+                continue
+
+            # Skip if it's part of a qualified name we already caught
+            # (check if there's a dot before the function name)
+            start = m.start(1)
+            if start > 0 and line[start - 1] == '.':
+                continue
+
+            key = (upper, line_num)
+            if key not in seen:
+                seen.add(key)
+                udfs.append((line_num, func_name))
+
+    return udfs
+
+
+# ===========================================================================
 #  CLI
 # ===========================================================================
 
-def process_file(input_path: str, output_path: Optional[str],
-                 dry_run: bool = False) -> ConversionReport:
-    converter = FileConverter()
+def process_file(input_path, output_path=None, dry_run=False, annotate=False):
+    # type: (str, Optional[str], bool, bool) -> ConversionReport
+    converter = FileConverter(annotate=annotate)
     with open(input_path, 'r', encoding='utf-8') as f:
         source = f.read()
 
     result, report = converter.convert_file(source, filepath=input_path)
+
+    # Scan converted output for items needing manual review,
+    # and scan original source for user-defined functions.
+    if not report.skipped:
+        out_file = output_path or input_path
+        report.flags = scan_for_flags(result, out_file)
+        report.udfs = scan_for_udfs(source, input_path)
 
     if report.skipped:
         if not dry_run and output_path:
@@ -1079,8 +1584,8 @@ def process_file(input_path: str, output_path: Optional[str],
 
 
 def process_directory(input_dir, output_dir,
-                      recursive, dry_run):
-    # type: (str, str, bool, bool) -> List[ConversionReport]
+                      recursive, dry_run, annotate=False):
+    # type: (str, str, bool, bool, bool) -> List[ConversionReport]
     reports = []
     extensions = ('*.js', '*.sql', '*.hql', '*.hive', '*.ddl', '*.dml')
     for ext in extensions:
@@ -1088,14 +1593,14 @@ def process_directory(input_dir, output_dir,
         for fpath in sorted(Path(input_dir).glob(pattern)):
             rel = fpath.relative_to(input_dir)
             out = str(Path(output_dir) / rel)
-            reports.append(process_file(str(fpath), out, dry_run))
+            reports.append(process_file(str(fpath), out, dry_run, annotate))
     return reports
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Convert SQL dialects in .js and .sql files based on "
-                    "--!impala / --!hive / --!null labels."
+                    "--!impala / --!hive / --!null dialect directives."
     )
     parser.add_argument("input", nargs='?', help="Input .js/.sql file or directory")
     parser.add_argument("-o", "--output", help="Output file or directory")
@@ -1103,6 +1608,9 @@ def main():
     parser.add_argument("-n", "--dry-run", action="store_true",
                         help="Preview changes without writing")
     parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("--annotate", action="store_true",
+                        help="Add comments showing removed/replaced code "
+                             "(default: clean output without comments)")
     parser.add_argument("--self-test", action="store_true",
                         help="Run built-in self-test")
     args = parser.parse_args()
@@ -1115,20 +1623,30 @@ def main():
         logging.getLogger().setLevel(logging.DEBUG)
 
     inp = args.input
+    reports = []
+
     if os.path.isdir(inp):
         if not args.output:
             log.error("Output directory (-o) required for directory input.")
             sys.exit(1)
-        reports = process_directory(inp, args.output, args.recursive, args.dry_run)
+        reports = process_directory(inp, args.output, args.recursive,
+                                    args.dry_run, args.annotate)
         converted = [r for r in reports if not r.skipped]
         skipped   = [r for r in reports if r.skipped]
         log.info(f"\nProcessed {len(reports)} files: "
                  f"{len(converted)} converted, {len(skipped)} skipped.")
     elif os.path.isfile(inp):
-        process_file(inp, args.output, args.dry_run)
+        report = process_file(inp, args.output, args.dry_run, args.annotate)
+        reports = [report]
     else:
         log.error(f"Not found: {inp}")
         sys.exit(1)
+
+    # Generate review report in the same directory as this script
+    if reports and not args.dry_run:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        report_path = os.path.join(script_dir, "conversion_review_report.txt")
+        generate_review_report(reports, report_path)
 
 
 # ===========================================================================
@@ -1333,9 +1851,9 @@ def _self_test():
     for rule in sorted(set(report.rules_applied)):
         print(f"    ✓ {rule}")
 
-    # Label
-    check('--!trino' in result,                "Label not changed to --!trino")
-    check('--!impala' not in result,           "Old --!impala label still present")
+    # Directive
+    check('--!trino' in result,                "Directive not changed to --!trino")
+    check('--!impala' not in result,           "Old --!impala directive still present")
 
     # JS untouched
     check('var JavaImporter = new JavaImporter(java.sql);' in result,
@@ -1356,11 +1874,11 @@ def _self_test():
     check('REAL' in result,                   "[impala] FLOAT not converted")
     check('INSERT INTO' in result,            "[impala] INSERT OVERWRITE not converted")
     check('ARRAY_JOIN(ARRAY_AGG(' in result,  "[impala] GROUP_CONCAT not converted")
-    check('TO_UNIXTIME(NOW())' in result,     "[impala] UNIX_TIMESTAMP not converted")
+    check('TO_UNIXTIME(current_timestamp)' in result,     "[impala] UNIX_TIMESTAMP not converted")
     check('XXHASH64(' in result,              "[impala] FNV_HASH not converted")
     check("DATE_ADD('day'" in result,         "[impala] DATE_ADD not converted")
     check("DATE_DIFF('month'" in result,      "[impala] MONTHS_BETWEEN not converted")
-    check('REMOVED' in result and 'COMPUTE STATS' in result,
+    check('COMPUTE STATS' not in result,
           "[impala] COMPUTE STATS not removed")
 
     # ─── TEST 2: --!hive .js → --!presto ────────────────────────────
@@ -1374,9 +1892,9 @@ def _self_test():
     for rule in sorted(set(report2.rules_applied)):
         print(f"    ✓ {rule}")
 
-    # Label
-    check('--!presto' in result2,              "Label not changed to --!presto")
-    check('--!hive' not in result2,            "Old --!hive label still present")
+    # Directive
+    check('--!presto' in result2,              "Directive not changed to --!presto")
+    check('--!hive' not in result2,            "Old --!hive directive still present")
 
     # JS untouched
     check('var items = ["alpha", "beta", "gamma"]' in result2,
@@ -1391,14 +1909,16 @@ def _self_test():
     check('INSERT INTO' in result2,            "[hive] INSERT OVERWRITE not converted")
     check('ARRAY_AGG(' in result2,             "[hive] COLLECT_LIST not converted")
     check('CARDINALITY(' in result2,           "[hive] SIZE not converted")
-    check('TO_UNIXTIME(NOW())' in result2,     "[hive] UNIX_TIMESTAMP not converted")
+    check('TO_UNIXTIME(current_timestamp)' in result2,     "[hive] UNIX_TIMESTAMP not converted")
     check("DATE_DIFF('day'" in result2,        "[hive] DATEDIFF not converted")
     check('REGEXP_LIKE(' in result2,           "[hive] RLIKE not converted")
     check('CROSS JOIN UNNEST(' in result2,     "[hive] LATERAL VIEW EXPLODE not converted")
     check('STRPOS(haystack_col' in result2,    "[hive] LOCATE not converted")
     check('APPROX_PERCENTILE(' in result2,     "[hive] PERCENTILE_APPROX not converted")
-    check('STORED AS ORC' not in result2 or 'adjust for Presto' in result2,
+    check('STORED AS ORC' not in result2,
           "[hive] STORED AS not handled")
+    check("WITH (format = 'ORC')" in result2,
+          "[hive] STORED AS not converted to WITH format")
 
     # ─── TEST 3: --!null .js → no conversion ─────────────────────────
     print(f"\n{SEP}")
@@ -1411,7 +1931,7 @@ def _self_test():
 
     check(report3.skipped is True,            "[null js] file was not skipped")
     check(result3 == SAMPLE_NULL,             "[null js] file content was modified")
-    check('--!null' in result3,               "[null js] label was changed")
+    check('--!null' in result3,               "[null js] directive was changed")
     check('SELECT * FROM whatever' in result3,"[null js] SQL was modified")
 
     # ─── TEST 4: --!impala .sql → --!trino (raw SQL) ─────────────────
@@ -1425,8 +1945,8 @@ def _self_test():
     for rule in sorted(set(report4.rules_applied)):
         print(f"    ✓ {rule}")
 
-    check('--!trino' in result4,                "[sql impala] label not changed to --!trino")
-    check('--!impala' not in result4,           "[sql impala] old label still present")
+    check('--!trino' in result4,                "[sql impala] directive not changed to --!trino")
+    check('--!impala' not in result4,           "[sql impala] old directive still present")
     check('VARCHAR' in result4,                 "[sql impala] STRING not converted")
     check('REAL' in result4,                    "[sql impala] FLOAT not converted")
     check('COALESCE(' in result4,               "[sql impala] NVL not converted")
@@ -1436,15 +1956,17 @@ def _self_test():
     check("CAST(DATE_TRUNC('mm', mn.admissiondate) AS DATE)" in result4,
           "[sql impala] TO_DATE(TRUNC(...)) nested parens broken")
     # Nested TRUNC inside DATEDIFF second argument
-    check("DATE_DIFF('day', DATE_TRUNC('dd', ts), NOW())" in result4,
+    check("DATE_DIFF('day', DATE_TRUNC('dd', ts), current_timestamp)" in result4,
           "[sql impala] DATEDIFF(NOW(), TRUNC(...)) nested parens broken")
     check("DATE_DIFF('day'" in result4,         "[sql impala] DATEDIFF not converted")
     check('INSERT INTO' in result4,             "[sql impala] INSERT OVERWRITE not converted")
     check('ARRAY_JOIN(ARRAY_AGG(' in result4,   "[sql impala] GROUP_CONCAT not converted")
-    check('REMOVED' in result4 and 'COMPUTE STATS' in result4,
+    check('COMPUTE STATS' not in result4,
           "[sql impala] COMPUTE STATS not removed")
-    check('STORED AS PARQUET' not in result4 or 'adjust for Trino' in result4,
+    check('STORED AS PARQUET' not in result4,
           "[sql impala] STORED AS not handled")
+    check("WITH (format = 'PARQUET')" in result4,
+          "[sql impala] STORED AS not converted to WITH format")
     # SQL comments must still be there
     check('-- Raw Impala SQL file' in result4,  "[sql impala] SQL comment was mangled")
     # New rules
@@ -1472,11 +1994,11 @@ def _self_test():
     for rule in sorted(set(report5.rules_applied)):
         print(f"    ✓ {rule}")
 
-    check('--!presto' in result5,              "[sql hive] label not changed to --!presto")
-    check('--!hive' not in result5,            "[sql hive] old label still present")
+    check('--!presto' in result5,              "[sql hive] directive not changed to --!presto")
+    check('--!hive' not in result5,            "[sql hive] old directive still present")
     check('ARRAY_AGG(' in result5,             "[sql hive] COLLECT_LIST not converted")
     check('CARDINALITY(' in result5,           "[sql hive] SIZE not converted")
-    check('TO_UNIXTIME(NOW())' in result5,     "[sql hive] UNIX_TIMESTAMP not converted")
+    check('TO_UNIXTIME(current_timestamp)' in result5,     "[sql hive] UNIX_TIMESTAMP not converted")
     check("DATE_DIFF('day'" in result5,        "[sql hive] DATEDIFF not converted")
     check('REGEXP_LIKE(' in result5,           "[sql hive] RLIKE not converted")
     check('CROSS JOIN UNNEST(' in result5,     "[sql hive] LATERAL VIEW EXPLODE not converted")
@@ -1500,7 +2022,7 @@ def _self_test():
 
     check(report6.skipped is True,            "[null sql] file was not skipped")
     check(result6 == SAMPLE_NULL_SQL,         "[null sql] file content was modified")
-    check('--!null' in result6,               "[null sql] label was changed")
+    check('--!null' in result6,               "[null sql] directive was changed")
     check('NVL(a, 0)' in result6,             "[null sql] SQL was modified")
     check('CAST(b AS STRING)' in result6,     "[null sql] SQL was modified")
 
