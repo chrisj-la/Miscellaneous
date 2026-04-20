@@ -110,17 +110,20 @@ def detect_dialect(source, scan_lines=30):
 # Quoted string literal (SQL uses single quotes)
 _Q = r"'[^']*'"
 
-# Level 0 (innermost parens): no further nesting, but allow quoted strings
-_L0 = rf"(?:[^()']*|{_Q})*"
+# Level 0 (innermost parens): no further nesting, but allow quoted strings.
+# Pattern structure: plain_chars (special_token plain_chars)*
+# This is backtrack-safe because each iteration of the repeat requires
+# a mandatory special token (quote or paren) before consuming more plain chars.
+_L0 = rf"[^()']*(?:{_Q}[^()']*)*"
 
 # Level 1: one level of nested parens + quoted strings
-_L1 = rf"(?:[^()']*|\({_L0}\)|{_Q})*"
+_L1 = rf"[^()']*(?:(?:\({_L0}\)|{_Q})[^()']*)*"
 
 # SINGLE function argument (stops at unbalanced comma).  2 nesting levels.
-_ARG = rf"(?:[^(),']*|\({_L1}\)|{_Q})*"
+_ARG = rf"[^(),']*(?:(?:\({_L1}\)|{_Q})[^(),']*)*"
 
 # FULL body inside outermost parens (commas allowed).  2 nesting levels.
-_BODY = rf"(?:[^()']*|\({_L1}\)|{_Q})*"
+_BODY = rf"[^()']*(?:(?:\({_L1}\)|{_Q})[^()']*)*"
 
 
 # ===========================================================================
