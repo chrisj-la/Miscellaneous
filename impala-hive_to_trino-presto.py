@@ -26,6 +26,7 @@ Usage:
 import re
 import os
 import sys
+import shutil
 import argparse
 import logging
 from pathlib import Path
@@ -1648,16 +1649,41 @@ def process_file(input_path, output_path=None, dry_run=False, annotate=False):
 
 
 def process_directory(input_dir, output_dir,
-                      recursive, dry_run, annotate=False):
-    # type: (str, str, bool, bool, bool) -> List[ConversionReport]
+                      recursive, dry_run, annotate=False,
+                      converted_only=False):
+    # type: (str, str, bool, bool, bool, bool) -> List[ConversionReport]
+    """
+    Process all files in input_dir.  Supported SQL/JS files are converted;
+    all other files are copied unchanged to output_dir (unless
+    converted_only=True, which skips unsupported file types).
+    """
     reports = []
-    extensions = ('*.js', '*.sql', '*.hql', '*.hive', '*.ddl', '*.dml')
-    for ext in extensions:
-        pattern = f'**/{ext}' if recursive else ext
-        for fpath in sorted(Path(input_dir).glob(pattern)):
-            rel = fpath.relative_to(input_dir)
-            out = str(Path(output_dir) / rel)
+    supported_extensions = {'.js', '.sql', '.hql', '.hive', '.ddl', '.dml'}
+    copied_count = 0
+
+    if recursive:
+        all_files = sorted(Path(input_dir).rglob('*'))
+    else:
+        all_files = sorted(p for p in Path(input_dir).iterdir() if p.is_file())
+
+    for fpath in all_files:
+        if not fpath.is_file():
+            continue
+        rel = fpath.relative_to(input_dir)
+        out = str(Path(output_dir) / rel)
+
+        if fpath.suffix.lower() in supported_extensions:
+            # Supported file — run the converter
             reports.append(process_file(str(fpath), out, dry_run, annotate))
+        elif not converted_only and not dry_run:
+            # Unsupported file — copy as-is
+            os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
+            shutil.copy2(str(fpath), out)
+            copied_count += 1
+
+    if copied_count > 0:
+        log.info(f"Copied {copied_count} non-SQL file(s) to {output_dir}")
+
     return reports
 
 
@@ -1675,6 +1701,9 @@ def main():
     parser.add_argument("--annotate", action="store_true",
                         help="Add comments showing removed/replaced code "
                              "(default: clean output without comments)")
+    parser.add_argument("--converted-only", action="store_true",
+                        help="In directory mode, only output converted SQL/JS "
+                             "files (default: copy all files to output)")
     parser.add_argument("--self-test", action="store_true",
                         help="Run built-in self-test")
     args = parser.parse_args()
@@ -1694,7 +1723,8 @@ def main():
             log.error("Output directory (-o) required for directory input.")
             sys.exit(1)
         reports = process_directory(inp, args.output, args.recursive,
-                                    args.dry_run, args.annotate)
+                                    args.dry_run, args.annotate,
+                                    args.converted_only)
         converted = [r for r in reports if not r.skipped]
         skipped   = [r for r in reports if r.skipped]
         log.info(f"\nProcessed {len(reports)} files: "
