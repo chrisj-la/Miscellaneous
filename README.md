@@ -67,10 +67,18 @@ python impala-hive_to_trino-presto.py input.sql -o output.sql
 python impala-hive_to_trino-presto.py script.js -o converted.js
 ```
 
-### Directory (all supported extensions)
+### Directory (all files copied, SQL/JS files converted)
 ```bash
 python impala-hive_to_trino-presto.py input_dir/ -o output_dir/
 python impala-hive_to_trino-presto.py input_dir/ -o output_dir/ --recursive
+```
+
+By default, all files from the input directory are copied to the output
+directory. SQL and JS files are converted; all other files (config files,
+CSVs, shell scripts, etc.) are copied unchanged. To output only converted
+files:
+```bash
+python impala-hive_to_trino-presto.py input_dir/ -o output_dir/ -r --converted-only
 ```
 
 ### Preview changes without writing
@@ -85,7 +93,7 @@ python impala-hive_to_trino-presto.py --self-test
 
 ### Full option list
 ```
-python impala-hive_to_trino-presto.py [-h] [-o OUTPUT] [-r] [-n] [-v] [--annotate] [--self-test] [input]
+python impala-hive_to_trino-presto.py [-h] [-o OUTPUT] [-r] [-n] [-v] [--annotate] [--converted-only] [--self-test] [input]
 
 positional arguments:
   input                 Input .js/.sql file or directory
@@ -96,6 +104,7 @@ options:
   -n, --dry-run         Preview changes without writing
   -v, --verbose         Enable debug-level logging
   --annotate            Add comments showing removed/replaced code
+  --converted-only      In directory mode, only output converted files
   --self-test           Run built-in self-test (6 test cases)
 ```
 
