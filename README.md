@@ -127,12 +127,15 @@ that requires manual completion.
 ### Review report
 
 After every conversion run (unless `--dry-run` is used), the script
-generates a `conversion_review_report.txt` file in the same directory as the
-script itself. This report contains two sections:
+generates a `conversion_report.txt` in the output directory (or the input
+file's directory for single-file mode). This report contains three sections:
 
-1. **Conversion flags** — items requiring manual attention, with line
+1. **Summary with dialect breakdown** — overall counts plus per-dialect
+   statistics (e.g. how many Impala→Trino vs Hive→Presto files, flags,
+   and UDFs in each).
+2. **Conversion flags** — items requiring manual attention, with line
    numbers and categories.
-2. **User-defined functions** — a consolidated list of every function call
+3. **User-defined functions** — a consolidated list of every function call
    not recognized as a built-in, with file locations and occurrence counts.
 
 Flag categories:
@@ -154,21 +157,25 @@ and SQL comments are excluded from scanning.
 Example report output:
 ```
 ==============================================================================
-  SQL DIALECT CONVERSION — REVIEW REPORT
+  SQL DIALECT CONVERSION REPORT
 ==============================================================================
 
 Files processed:        5
 Files converted:        4
 Files skipped:          1
-Files with flags:       1
-Total flags:            2
+Files with flags:       2
+Total flags:            3
 Files with UDFs:        3
 Unique UDFs detected:   7
 Total UDF references:   9
 
+Conversions by dialect:
+  --!hive → --!presto:  1 file(s), 1 flag(s), 1 file(s) with UDFs
+  --!impala → --!trino:  3 file(s), 2 flag(s), 2 file(s) with UDFs
+
 Flags by category:
   REMOVED: 1
-  TODO: 1
+  TODO: 2
 
 ------------------------------------------------------------------------------
   DETAILED FLAGS BY FILE
@@ -177,6 +184,9 @@ Flags by category:
 etl_impala.sql  [--!impala → --!trino]
   Line    15  [TODO]  TODO: Rewrite LEFT SEMI JOIN to WHERE EXISTS (...)
   Line    18  [REMOVED]  REMOVED: COMPUTE STATS (not needed in Trino)
+
+etl_hive.sql  [--!hive → --!presto]
+  Line     6  [TODO]  TODO: Rewrite LEFT SEMI JOIN to WHERE EXISTS (...)
 
 ------------------------------------------------------------------------------
   USER-DEFINED FUNCTIONS DETECTED
@@ -535,8 +545,8 @@ via regex, require runtime context, or risk producing incorrect results:
 1. **Run with `--dry-run` first** to see which rules fire and how many regions
    are affected per file.
 
-2. **Review `conversion_review_report.txt`** — generated automatically in the
-   script directory after every conversion run. This report lists every file
+2. **Review `conversion_report.txt`** — generated automatically in the
+   output directory after every conversion run. This report lists every file
    with items needing manual attention, organized by category (TODO, REMOVED,
    INSERT OVERWRITE, DDL ADJUSTMENT) with line numbers.
 
