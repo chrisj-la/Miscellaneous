@@ -459,6 +459,16 @@ class ImpalaToTrinoConverter(SQLConverter):
         _add(r, "ADD_MONTHS(d, n) → DATE_ADD('month', n, d)",
              r"\bADD_MONTHS\s*\(\s*(" + _ARG + r")\s*,\s*(" + _ARG + r")\s*\)",
              lambda m: f"DATE_ADD('month', {m.group(2).strip()}, {m.group(1).strip()})")
+        # Impala *_ADD / *_SUB family: MONTHS_ADD, MONTHS_SUB, DAYS_ADD, etc.
+        for _unit in ['year', 'month', 'week', 'day', 'hour', 'minute', 'second']:
+            _U = _unit.upper()
+            _pl = _U + 'S'  # YEARS, MONTHS, WEEKS, ...
+            _add(r, f"{_pl}_ADD(d, n) → DATE_ADD('{_unit}', n, d)",
+                 r"\b" + _pl + r"_ADD\s*\(\s*(" + _ARG + r")\s*,\s*(" + _ARG + r")\s*\)",
+                 lambda m, u=_unit: f"DATE_ADD('{u}', {m.group(2).strip()}, {m.group(1).strip()})")
+            _add(r, f"{_pl}_SUB(d, n) → DATE_ADD('{_unit}', -n, d)",
+                 r"\b" + _pl + r"_SUB\s*\(\s*(" + _ARG + r")\s*,\s*(" + _ARG + r")\s*\)",
+                 lambda m, u=_unit: f"DATE_ADD('{u}', -({m.group(2).strip()}), {m.group(1).strip()})")
         _add(r, "MONTHS_BETWEEN(a,b) → DATE_DIFF('month', b, a)",
              r"\bMONTHS_BETWEEN\s*\(\s*(" + _ARG + r")\s*,\s*(" + _ARG + r")\s*\)",
              lambda m: f"DATE_DIFF('month', {m.group(2).strip()}, {m.group(1).strip()})")
@@ -1408,6 +1418,13 @@ _KNOWN_BUILTINS = frozenset(k.upper() for k in [
     'date_add', 'date_sub', 'date_diff', 'datediff',
     'date_trunc', 'date_part', 'extract',
     'add_months', 'months_between', 'last_day', 'next_day',
+    'months_add', 'months_sub',
+    'days_add', 'days_sub',
+    'hours_add', 'hours_sub',
+    'minutes_add', 'minutes_sub',
+    'seconds_add', 'seconds_sub',
+    'weeks_add', 'weeks_sub',
+    'years_add', 'years_sub',
     'unix_timestamp', 'to_unixtime', 'from_unixtime',
     'from_utc_timestamp', 'to_utc_timestamp',
     'to_date',
