@@ -212,7 +212,7 @@ These may be user-defined functions that require manual porting to Trino/Presto.
 
 ## Conversions Performed
 
-### Impala → Trino (68 active rules + DECODE pre-pass)
+### Impala → Trino (82 active rules + DECODE pre-pass)
 
 **Statements removed/neutralized:**
 
@@ -269,6 +269,13 @@ Other DDL clauses are removed (or commented out with `--annotate`):
 | `DATE_ADD(d, n)` | `DATE_ADD('day', n, d)` (args reordered) |
 | `DATE_SUB(d, n)` | `DATE_ADD('day', -(n), d)` |
 | `ADD_MONTHS(d, n)` | `DATE_ADD('month', n, d)` |
+| `MONTHS_ADD(d, n)` / `MONTHS_SUB(d, n)` | `DATE_ADD('month', n, d)` / `DATE_ADD('month', -(n), d)` |
+| `DAYS_ADD(d, n)` / `DAYS_SUB(d, n)` | `DATE_ADD('day', n, d)` / `DATE_ADD('day', -(n), d)` |
+| `HOURS_ADD(d, n)` / `HOURS_SUB(d, n)` | `DATE_ADD('hour', ...)` |
+| `MINUTES_ADD(d, n)` / `MINUTES_SUB(d, n)` | `DATE_ADD('minute', ...)` |
+| `SECONDS_ADD(d, n)` / `SECONDS_SUB(d, n)` | `DATE_ADD('second', ...)` |
+| `WEEKS_ADD(d, n)` / `WEEKS_SUB(d, n)` | `DATE_ADD('week', ...)` |
+| `YEARS_ADD(d, n)` / `YEARS_SUB(d, n)` | `DATE_ADD('year', ...)` |
 | `MONTHS_BETWEEN(a, b)` | `DATE_DIFF('month', b, a)` |
 | `TO_DATE(ts)` | `CAST(ts AS DATE)` |
 | `TRUNC(d, 'MM')` | `DATE_TRUNC('mm', d)` |
