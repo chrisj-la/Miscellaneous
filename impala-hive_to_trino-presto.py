@@ -1203,10 +1203,10 @@ def scan_for_flags(converted_text, filepath):
     return flags
 
 
-def generate_review_report(reports, report_path):
+def generate_conversion_report(reports, report_path):
     # type: (List[ConversionReport], str) -> None
     """
-    Write a review report listing all files with items that need
+    Write a conversion report listing all files with items that need
     manual attention (TODOs, removed statements, DDL adjustments)
     and any detected user-defined functions.
     """
@@ -1215,7 +1215,7 @@ def generate_review_report(reports, report_path):
 
     with open(report_path, 'w', encoding='utf-8') as f:
         f.write("=" * 78 + "\n")
-        f.write("  SQL DIALECT CONVERSION — REVIEW REPORT\n")
+        f.write("  SQL DIALECT CONVERSION REPORT\n")
         f.write("=" * 78 + "\n\n")
 
         # Summary
@@ -1242,6 +1242,26 @@ def generate_review_report(reports, report_path):
         f.write(f"Files with UDFs:        {len(udf_reports)}\n")
         f.write(f"Unique UDFs detected:   {udf_count}\n")
         f.write(f"Total UDF references:   {total_udf_calls}\n")
+
+        # ── Breakdown by dialect pair ──────────────────────────────
+        dialect_groups = {}  # (dialect, target) -> list of reports
+        for r in reports:
+            if r.skipped:
+                continue
+            key = (r.dialect, r.target)
+            if key not in dialect_groups:
+                dialect_groups[key] = []
+            dialect_groups[key].append(r)
+
+        if dialect_groups:
+            f.write("\nConversions by dialect:\n")
+            for (dialect, target), group in sorted(dialect_groups.items()):
+                g_flags = sum(len(r.flags) for r in group)
+                g_udf_files = sum(1 for r in group if r.udfs)
+                f.write(f"  --!{dialect} → --!{target}:  "
+                        f"{len(group)} file(s), "
+                        f"{g_flags} flag(s), "
+                        f"{g_udf_files} file(s) with UDFs\n")
 
         # ── Flag details ───────────────────────────────────────────
         if flagged_reports:
@@ -1303,7 +1323,7 @@ def generate_review_report(reports, report_path):
 
         f.write("\n" + "=" * 78 + "\n")
 
-    log.info(f"Review report written to {report_path}"
+    log.info(f"Conversion report written to {report_path}"
              f" ({flagged} flagged file(s), {total_flags} flag(s), "
              f"{udf_count} UDF(s) detected)")
 
@@ -1753,11 +1773,18 @@ def main():
         log.error(f"Not found: {inp}")
         sys.exit(1)
 
-    # Generate review report in the same directory as this script
+    # Generate conversion report in the output directory
     if reports and not args.dry_run:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        report_path = os.path.join(script_dir, "conversion_review_report.txt")
-        generate_review_report(reports, report_path)
+        if args.output:
+            if os.path.isdir(inp):
+                report_dir = args.output
+            else:
+                report_dir = os.path.dirname(args.output) or '.'
+        else:
+            report_dir = os.path.dirname(os.path.abspath(inp))
+        os.makedirs(report_dir, exist_ok=True)
+        report_path = os.path.join(report_dir, "conversion_report.txt")
+        generate_conversion_report(reports, report_path)
 
 
 # ===========================================================================
